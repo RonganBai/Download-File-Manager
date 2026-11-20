@@ -1,0 +1,23 @@
+﻿# 一键构建：PyInstaller 打包 exe → Inno Setup 生成安装包
+# 用法：powershell -ExecutionPolicy Bypass -File .\build.ps1
+$ErrorActionPreference = "Stop"
+$root = $PSScriptRoot
+Set-Location $root
+$out = Join-Path $env:LOCALAPPDATA "DownloadButler_build"   # 构建目录放在项目之外
+
+python -m pip install -r requirements.txt
+
+python -m PyInstaller --noconfirm --windowed --name "DownloadButler" `
+    --icon "$root\assets\icon.ico" --add-data "$root\assets;assets" `
+    --exclude-module PyQt6.QtWebEngineCore --exclude-module PyQt6.QtWebEngineWidgets `
+    --exclude-module PyQt6.QtPdf --exclude-module PyQt6.Qt3DCore --exclude-module PyQt6.QtQml `
+    --exclude-module PyQt6.QtQuick --exclude-module PyQt6.QtMultimedia --exclude-module tkinter `
+    --workpath "$out\work" --specpath "$out\work" --distpath "$out\dist" download_manager.py
+if ($LASTEXITCODE) { throw "PyInstaller 失败" }
+
+$iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+          "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) { throw "未找到 Inno Setup 6：winget install JRSoftware.InnoSetup" }
+& $iscc /Qp "/DDistDir=$out\dist\DownloadButler" "$root\installer\DownloadButler.iss"
+if ($LASTEXITCODE) { throw "Inno Setup 失败" }
+Write-Host "完成：安装包在 installer\Output\" -ForegroundColor Green

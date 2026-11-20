@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+installer/Output/
+# 早期的一次性整理脚本，不属于本程序
+整理下载.ps1

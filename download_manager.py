@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QLabel, QPushButton,
                              QStackedWidget, QScrollArea, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QTextBrowser,
                              QProgressBar, QSystemTrayIcon, QDialog, QFileDialog, QHeaderView, QSlider)
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 APP = "下载管家"
 CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
 CFG_PATH = os.path.join(CFG_DIR, "config.json")

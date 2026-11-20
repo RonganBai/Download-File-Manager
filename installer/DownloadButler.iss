@@ -1,6 +1,6 @@
 ﻿; 下载管家 安装包脚本（Inno Setup 6）——由 build.ps1 调用
 #define AppName "下载管家"
-#define AppVersion "2.2.0"
+#define AppVersion "2.2.1"
 #define AppPublisher "RonganBai"
 #define AppExe "DownloadButler.exe"
 #ifndef DistDir
@@ -29,9 +29,8 @@ UninstallDisplayName={#AppName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-; 程序运行时持有这个互斥体：安装 / 卸载前提示关闭
-AppMutex=DownloadButlerMutex
-CloseApplications=yes
+; 程序常驻托盘，关闭窗口不会退出：安装 / 卸载前由 [Code] 自动结束它，无需用户手动退出
+CloseApplications=no
 VersionInfoVersion={#AppVersion}
 VersionInfoProductName=Download Butler
 
@@ -74,6 +73,47 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchApp}"; Flags: nowait postin
 Type: filesandordirs; Name: "{localappdata}\DownloadButler\thumbs"
 
 [Code]
+var
+  WasRunning: Boolean;
+
+{ 结束正在运行的下载管家（它持有 DownloadButlerMutex），返回之前是否在运行 }
+function StopApp(): Boolean;
+var
+  Code, I: Integer;
+begin
+  Result := CheckForMutexes('DownloadButlerMutex');
+  if Result then
+  begin
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, Code);
+    for I := 1 to 20 do
+    begin
+      if not CheckForMutexes('DownloadButlerMutex') then Break;
+      Sleep(100);
+    end;
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  WasRunning := StopApp();
+  Result := '';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+begin
+  { 静默更新时（例如以后的自动更新），把原来在运行的程序在后台重新启动 }
+  if (CurStep = ssPostInstall) and WasRunning and WizardSilent() then
+    Exec(ExpandConstant('{app}\{#AppExe}'), '--min', '', SW_SHOW, ewNoWait, Code);
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  StopApp();
+  Result := True;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   { 程序内开启的开机启动也一并移除 }

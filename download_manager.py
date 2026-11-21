@@ -13,7 +13,7 @@ import winreg
 from ctypes import wintypes
 from datetime import datetime, timedelta
 
-from PyQt6.QtCore import QFileSystemWatcher, QThread, pyqtSignal, Qt, QTimer, QSize, QRectF, QPropertyAnimation, pyqtProperty, QFileInfo, QUrl, QMimeData, QPoint
+from PyQt6.QtCore import QFileSystemWatcher, QProcess, QThread, pyqtSignal, Qt, QTimer, QSize, QRectF, QPropertyAnimation, pyqtProperty, QFileInfo, QUrl, QMimeData, QPoint
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QPen, QAction, QKeySequence, QShortcut, QPainterPath, QDesktopServices, QImage, QImageReader
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QLabel, QPushButton, QLineEdit, QHBoxLayout, QVBoxLayout,
@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QLabel, QPushButton,
                              QStackedWidget, QScrollArea, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QTextBrowser,
                              QProgressBar, QSystemTrayIcon, QDialog, QFileDialog, QHeaderView, QSlider)
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 APP = "下载管家"
 CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
 CFG_PATH = os.path.join(CFG_DIR, "config.json")
@@ -29,10 +29,10 @@ ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(_
 DEFAULTS = dict(auto=True, clean_on=False, clean_days=30, cap_on=False, cap_gb=20.0, protect=["重要文件"],
                 autostart=False, close="tray", theme="dark", side_open=True,
                 accent="blue", bg_image="", bg_vis=35, card_alpha=88, win_opacity=100, img_colors=[],
-                sort_key="time", sort_desc=True)
+                sort_key="time", sort_desc=True, settle_sec=10, rules=[], root="", by_month=True)
 BORDER = 6
 
-RULES = [
+DEFAULT_RULES = [
     ("重要文件", "", ".pdf .doc .docx .xls .xlsx .ppt .pptx .txt .md .csv .wps .et .dps .rtf .odt"),
     ("安装包", "", ".exe .msi .msix .appx .apk .dmg .iso"),
     ("压缩包", "", ".zip .rar .7z .tar .gz .bz2 .xz"),
@@ -41,9 +41,17 @@ RULES = [
     ("音乐", "", ".mp3 .wav .flac .aac .m4a .ogg"),
     ("代码", "", ".py .js .html .css .json .java .c .cpp .ps1 .bat .sh"),
 ]
-CATS = [r[0] for r in RULES] + ["其他文件"]
-GLYPH = {r[0]: r[1] for r in RULES}
-GLYPH.update({"其他文件": "", "未整理": "", "全部文件": ""})
+OTHER = "其他文件"                     # 兜底分类，固定存在
+RESERVED_CATS = {OTHER, "未整理", "全部文件"}
+DEFAULT_GLYPH = {r[0]: r[1] for r in DEFAULT_RULES}
+DEFAULT_GLYPH.update({OTHER: "\ue7c3", "未整理": "\ue896", "全部文件": "\ue8b7"})
+FOLDER_GLYPH = "\ue8b7"
+# 以下是“当前生效”的规则，由 apply_rules() 原地更新（其他地方持有的引用保持有效）
+RULES = list(DEFAULT_RULES)
+CATS = [r[0] for r in RULES] + [OTHER]
+GLYPH = dict(DEFAULT_GLYPH)
+EXT_MAP = {}
+BY_MONTH = True                       # 是否按“年-月”分子文件夹
 SORTS = (("修改时间", "time"), ("名称", "name"), ("大小", "size"), ("分类", "cat"), ("类型（扩展名）", "ext"))
 COL_KEYS = ("name", "cat", "size", "time")
 COL_NAMES = ("名称", "分类", "大小", "修改时间")
@@ -51,7 +59,14 @@ TIME_FILTERS = (("全部时间", None), ("今天", 0), ("最近 7 天", 7), ("�
 MB = 1024 * 1024
 SIZE_FILTERS = (("全部大小", None), ("小于 1 MB", (0, MB)), ("1 – 100 MB", (MB, 100 * MB)),
                 ("100 MB – 1 GB", (100 * MB, 1024 * MB)), ("大于 1 GB", (1024 * MB, 1 << 62)))
-SKIP_EXT = {".crdownload", ".part", ".partial", ".download", ".tmp"}
+# 各浏览器 / 下载工具的未完成文件：Chrome/Edge、Firefox、Safari、Opera、迅雷、uTorrent、qBittorrent、
+# BitComet、IDM、Free Download Manager、JDownloader、Chrome 文件系统 API 等
+SKIP_EXT = {".crdownload", ".part", ".partial", ".download", ".tmp", ".temp", ".opdownload", ".xltd", ".td",
+            ".!ut", ".!qb", ".bc!", ".fdmdownload", ".dtapart", ".crswap", ".filepart", ".downloading",
+            ".aria2", ".jdownload", ".idm", ".~tmp"}
+SKIP_SUFFIX = (".xltd.cfg", ".td.cfg")                            # 迅雷的任务配置文件
+COMPANION_EXT = (".part", ".aria2", ".xltd", ".td", ".crdownload", ".!ut", ".!qb", ".bc!")
+SKIP_NAMES = {"desktop.ini", "thumbs.db"}
 THUMB_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico"}
 
 # ---------------- 主题（与格式转换器 v1.13 相同的配色） ----------------
@@ -352,6 +367,100 @@ def downloads_dir():
 ROOT = downloads_dir()
 
 
+# ---------------- 可配置：分类规则 / 管理的文件夹 ----------------
+def parse_exts(text):
+    """“pdf, .DOCX  txt” → [".pdf", ".docx", ".txt"]（去重、保持顺序）。"""
+    out = []
+    for t in text.replace(",", " ").replace("，", " ").replace(";", " ").replace("；", " ").split():
+        t = "." + t.strip().lstrip(".").lower()
+        if len(t) > 1 and t not in out:
+            out.append(t)
+    return out
+
+
+def validate_rules(rows):
+    """rows: [(分类名, 扩展名文本), ...]。返回 (规范化后的 [[名, ".a .b"]], 错误信息)。"""
+    out, seen = [], set()
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != 2 or not all(isinstance(x, str) for x in row):
+            return None, "分类规则格式不正确"
+        name, exts = row[0].strip(), row[1]
+        if not name:
+            return None, "分类名不能为空"
+        err = bad_filename(name)
+        if err:
+            return None, f"分类名“{name}”不可用：{err}"
+        if name in RESERVED_CATS:
+            return None, f"“{name}”是保留名称，请换一个"
+        if name.lower() in seen:
+            return None, f"分类“{name}”重复了"
+        seen.add(name.lower())
+        e = parse_exts(exts)
+        if not e:
+            return None, f"分类“{name}”至少需要一个扩展名"
+        out.append([name, " ".join(e)])
+    if not out:
+        return None, "至少保留一个分类"
+    return out, ""
+
+
+def apply_rules(rules):
+    """让配置里的分类规则生效；rules 为空或不合法时使用内置规则。返回错误信息（合法时为空）。"""
+    norm, err = validate_rules(rules) if rules else (None, "")
+    if norm is None:
+        new = list(DEFAULT_RULES)
+    else:
+        new = [(n, DEFAULT_GLYPH.get(n, FOLDER_GLYPH), e) for n, e in norm]
+    RULES[:] = new
+    CATS[:] = [r[0] for r in RULES] + [OTHER]
+    GLYPH.clear()
+    GLYPH.update({c: DEFAULT_GLYPH.get(c, FOLDER_GLYPH) for c in CATS})
+    GLYPH.update({k: DEFAULT_GLYPH[k] for k in RESERVED_CATS})
+    EXT_MAP.clear()
+    for name, _, exts in reversed(RULES):     # 同一扩展名出现在多个分类时，排在前面的优先
+        for e in exts.split():
+            EXT_MAP[e] = name
+    return err
+
+
+def _norm(p):
+    return os.path.normcase(os.path.realpath(p)).rstrip("\\/")
+
+
+def root_problem(path):
+    """检查一个文件夹能否作为“管理的文件夹”；可以时返回空字符串。"""
+    if not path or not os.path.isdir(path):
+        return "文件夹不存在"
+    try:
+        if is_reparse(os.lstat(path)):
+            return "不能选择符号链接或目录联接"
+    except OSError:
+        return "无法访问该文件夹"
+    p = _norm(path)
+    if len(p) <= 3 or p.startswith("\\\\") and p.count("\\") <= 4:   # C:\ 或 \\server\share 根
+        return "不能选择整个磁盘（或网络共享）的根目录"
+    env = os.environ
+    home = _norm(env["USERPROFILE"]) if env.get("USERPROFILE") else None
+    if p == home:
+        return "不能选择用户主目录本身，请选择其中的某个文件夹"
+    for k in ("SystemRoot", "WINDIR", "ProgramFiles", "ProgramFiles(x86)", "ProgramData", "APPDATA", "LOCALAPPDATA"):
+        if env.get(k):
+            d = _norm(env[k])
+            if p == d or p.startswith(d + os.sep):
+                return "不能选择系统、程序或应用数据目录"
+    return ""
+
+
+def resolve_root(cfg):
+    p = cfg.get("root") or ""
+    if p and not root_problem(p):
+        return os.path.abspath(p)
+    return downloads_dir()
+
+
+apply_rules([])
+
+
 class SHFILEOPSTRUCTW(ctypes.Structure):
     _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", ctypes.c_void_p), ("pTo", ctypes.c_void_p),
                 ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL), ("hNameMappings", ctypes.c_void_p),
@@ -359,17 +468,127 @@ class SHFILEOPSTRUCTW(ctypes.Structure):
 
 
 def recycle(paths):
-    """移到回收站（可还原）。"""
+    """移到回收站（可还原）。
+    文件放不进回收站时（太大 / 网络盘 / 回收站被关闭），Windows 默认会直接永久删除；
+    这里加 WANTNUKEWARNING，让系统先弹窗确认，绝不静默永久删除。"""
     if not paths:
         return
     buf = ctypes.create_unicode_buffer("\0".join(os.path.abspath(p) for p in paths) + "\0\0")
     op = SHFILEOPSTRUCTW()
     op.wFunc = 3                              # FO_DELETE
     op.pFrom = ctypes.cast(buf, ctypes.c_void_p)
-    op.fFlags = 0x0040 | 0x0010 | 0x0400 | 0x0004   # ALLOWUNDO | NOCONFIRMATION | NOERRORUI | SILENT
+    # ALLOWUNDO | NOCONFIRMATION | NOERRORUI | SILENT | WANTNUKEWARNING
+    op.fFlags = 0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x4000
     r = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
     if r:
         raise OSError(f"删除失败（代码 {r}）")
+    if op.fAnyOperationsAborted:
+        raise OSError("删除已取消")
+
+
+def _volume_guid(path):
+    buf = ctypes.create_unicode_buffer(260)
+    mount = ctypes.create_unicode_buffer(260)
+    if not ctypes.windll.kernel32.GetVolumePathNameW(os.path.abspath(path), mount, 260):
+        return None, None
+    if not ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW(mount.value, buf, 260):
+        return mount.value, None
+    v = buf.value                              # \\?\Volume{GUID}\
+    i, j = v.find("{"), v.find("}")
+    return mount.value, (v[i:j + 1] if 0 <= i < j else None)
+
+
+def recycle_limit(path):
+    """该文件所在卷的回收站能容纳的单个文件上限（字节）；返回 0 表示这个位置没有回收站。"""
+    try:
+        mount, guid = _volume_guid(path)
+        if not mount or ctypes.windll.kernel32.GetDriveTypeW(mount) != 3:   # 只有本地固定磁盘有回收站
+            return 0
+        total = shutil.disk_usage(mount).total
+        if guid:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\\" + guid) as k:
+                    try:
+                        if winreg.QueryValueEx(k, "NukeOnDelete")[0]:
+                            return 0
+                    except OSError:
+                        pass
+                    try:
+                        return int(winreg.QueryValueEx(k, "MaxCapacity")[0]) * MB
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+        return total // 20                     # 没有记录时按系统默认的约 5% 保守估计
+    except Exception:
+        return 0
+
+
+def can_recycle(path, size):
+    lim = recycle_limit(path)
+    return lim > 0 and size < lim
+
+
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def is_reparse(st):
+    """符号链接 / 目录联接（junction）等重解析点。"""
+    return bool(getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def inside_managed(path):
+    """真实路径必须位于某个分类文件夹之内，防止通过联接 / 链接删到下载文件夹以外。"""
+    try:
+        real = os.path.normcase(os.path.realpath(path))
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if is_reparse(st):
+        return False
+    for c in CATS:
+        base = os.path.normcase(os.path.realpath(os.path.join(ROOT, c)))
+        if real.startswith(base + os.sep):
+            return True
+    return False
+
+
+RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def bad_filename(name):
+    """返回文件名不合法的原因；合法时返回空字符串。"""
+    if any(ch in name for ch in '\\/:*?"<>|') or any(ord(ch) < 32 for ch in name):
+        return "文件名不能包含 \\ / : * ? \" < > | 或控制字符"
+    if name != name.rstrip(". "):
+        return "文件名不能以空格或句点结尾"
+    if name.split(".")[0].strip().upper() in RESERVED_NAMES:
+        return "这是 Windows 保留的设备名，不能用作文件名"
+    if len(name) > 255:
+        return "文件名太长（最多 255 个字符）"
+    return ""
+
+
+def reveal_in_explorer(path):
+    """在资源管理器中定位文件。直接调用 Shell API，不经过命令行拼接，路径里的特殊字符不会被误解析。"""
+    try:
+        sh = ctypes.windll.shell32
+        sh.ILCreateFromPathW.restype = ctypes.c_void_p
+        sh.ILCreateFromPathW.argtypes = (wintypes.LPCWSTR,)
+        sh.SHOpenFolderAndSelectItems.argtypes = (ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.DWORD)
+        sh.ILFree.argtypes = (ctypes.c_void_p,)
+        ctypes.windll.ole32.CoInitialize(None)
+        pidl = sh.ILCreateFromPathW(os.path.abspath(path))
+        if pidl:
+            try:
+                if sh.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0:
+                    return
+            finally:
+                sh.ILFree(pidl)
+    except Exception:
+        pass
+    subprocess.Popen(["explorer.exe", "/select,", os.path.abspath(path)])
 
 
 def is_hidden(path):
@@ -388,20 +607,84 @@ def human(n):
     return f"{n:.1f} TB"
 
 
-def load_cfg():
+def sanitize_cfg(raw):
+    """逐项校验类型与范围；不合法的值回退到默认值，避免手改配置导致大量误删。"""
     c = dict(DEFAULTS)
-    try:
-        with open(CFG_PATH, encoding="utf-8") as f:
-            c.update(json.load(f))
-    except Exception:
-        pass
+    if not isinstance(raw, dict):
+        return c
+    for k, dv in DEFAULTS.items():
+        if k not in raw:
+            continue
+        v = raw[k]
+        if isinstance(dv, bool):
+            if isinstance(v, bool):
+                c[k] = v
+        elif isinstance(dv, (int, float)):
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v:
+                c[k] = type(dv)(v)
+        elif isinstance(dv, str):
+            if isinstance(v, str):
+                c[k] = v
+        elif isinstance(dv, list):
+            if isinstance(v, list) and all(isinstance(x, str) for x in v):
+                c[k] = list(v)
+    c["clean_days"] = min(max(int(c["clean_days"]), 1), 3650)
+    c["cap_gb"] = min(max(float(c["cap_gb"]), 0.5), 10000.0)
+    c["settle_sec"] = min(max(int(c["settle_sec"]), 3), 600)
+    if isinstance(raw.get("rules"), list):
+        norm, _ = validate_rules(raw["rules"])
+        c["rules"] = norm or []            # 不合法时回到内置规则
+    if c["root"] and root_problem(c["root"]):
+        c["root"] = ""                     # 文件夹不可用时回到系统“下载”文件夹
+    names = [r[0] for r in c["rules"]] if c["rules"] else [r[0] for r in DEFAULT_RULES]
+    c["protect"] = [p for p in c["protect"] if p in names + [OTHER]]
+    for k in ("bg_vis", "card_alpha", "win_opacity"):
+        c[k] = min(max(int(c[k]), 0), 100)
+    if c["theme"] not in BASE_THEMES:
+        c["theme"] = DEFAULTS["theme"]
+    if c["close"] not in ("tray", "quit"):
+        c["close"] = DEFAULTS["close"]
+    # 保留未知键（新版本写入的设置），降级再升级时不丢
+    for k, v in raw.items():
+        if k not in DEFAULTS:
+            c[k] = v
     return c
 
 
+def load_cfg():
+    try:
+        with open(CFG_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return dict(DEFAULTS)
+    except (OSError, ValueError):
+        # 配置损坏：先备份，避免下次保存时把用户原来的设置覆盖掉
+        try:
+            os.replace(CFG_PATH, CFG_PATH + datetime.now().strftime(".bad-%Y%m%d-%H%M%S"))
+        except OSError:
+            pass
+        log("配置文件损坏，已备份并使用默认设置")
+        return dict(DEFAULTS)
+    return sanitize_cfg(raw)
+
+
+def init_settings(cfg):
+    """启动时让“分类规则 / 管理的文件夹 / 年-月子文件夹”设置生效。"""
+    global ROOT, BY_MONTH
+    apply_rules(cfg.get("rules"))
+    ROOT = resolve_root(cfg)
+    BY_MONTH = bool(cfg.get("by_month", True))
+
+
 def save_cfg(c):
+    """原子写入：先写临时文件再替换，写到一半崩溃也不会损坏配置。"""
     os.makedirs(CFG_DIR, exist_ok=True)
-    with open(CFG_PATH, "w", encoding="utf-8") as f:
+    tmp = CFG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(c, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CFG_PATH)
 
 
 def autostart_enabled():
@@ -434,18 +717,23 @@ def set_autostart(on):
 
 # ---------------- 整理 / 清理 ----------------
 LOGS = []
+LOG_LOCK = threading.Lock()
 
 
 def log(msg):
-    LOGS.insert(0, datetime.now().strftime("%m-%d %H:%M:%S") + "  " + msg)
-    del LOGS[300:]
+    with LOG_LOCK:             # 清理在后台线程运行，也会写日志
+        LOGS.insert(0, datetime.now().strftime("%m-%d %H:%M:%S") + "  " + msg)
+        del LOGS[300:]
 
 
 def category_of(ext):
-    for name, _, exts in RULES:
-        if ext in exts.split():
-            return name
-    return "其他文件"
+    return EXT_MAP.get(ext, OTHER)
+
+
+def cat_dir(cat, mtime):
+    """文件在分类下的目标文件夹：按设置决定是否再分“年-月”子文件夹。"""
+    d = os.path.join(ROOT, cat)
+    return os.path.join(d, datetime.fromtimestamp(mtime).strftime("%Y-%m")) if BY_MONTH else d
 
 
 def free_path(d, name):
@@ -458,35 +746,54 @@ def free_path(d, name):
     return dest
 
 
-def organize():
-    """整理下载根目录里的新文件。返回 (已移动的文件名, 暂时无法整理的文件数)；
-    后者是仍在下载 / 被占用 / 刚写入的文件，需要稍后重试。"""
-    moved, pending = [], 0
+def is_partial(name, names):
+    """是否是未下载完的文件：本身是临时文件，或旁边还有同名的临时 / 控制文件
+    （Firefox 先放 0 字节占位文件 + .part；aria2 / 迅雷的控制文件与目标文件并存）。"""
+    low = name.lower()
+    if os.path.splitext(low)[1] in SKIP_EXT or low.endswith(SKIP_SUFFIX):
+        return True
+    return any(low + s in names for s in COMPANION_EXT)
+
+
+def organize(settle=None):
+    """整理下载根目录里的新文件。返回 (已移动的文件名, 多少秒后需要重试 或 None)。
+    仍在下载的文件不需要定时重试：下载完成改名时文件夹监视会再次触发整理；
+    只有“刚到达、还没稳定”或“被占用”的文件才安排重试。"""
+    settle = DEFAULTS["settle_sec"] if settle is None else settle
+    moved, retry = [], None
+
+    def later(sec):
+        nonlocal retry
+        retry = sec if retry is None else min(retry, sec)
     try:
         entries = list(os.scandir(ROOT))
     except OSError:
-        return moved, pending
+        return moved, retry
+    names = {e.name.lower() for e in entries}
     now = time.time()
     for e in entries:
         try:
-            if not e.is_file():
+            if not e.is_file(follow_symlinks=False):
                 continue
-            st = e.stat()   # Windows 上 scandir 已带回属性，不会再次访问磁盘
-            if st.st_file_attributes & 2:
+            st = e.stat(follow_symlinks=False)   # Windows 上 scandir 已带回属性，不会再次访问磁盘
+            if st.st_file_attributes & 2 or is_reparse(st):
+                continue
+            if e.name.lower() in SKIP_NAMES or is_partial(e.name, names):
+                continue
+            age = now - arrived_time(st)
+            if age < settle:                     # 刚下载完：留一会儿，浏览器的“打开 / 在文件夹中显示”还能找到它
+                later(settle - age + 0.5)
                 continue
             ext = os.path.splitext(e.name)[1].lower()
-            if ext in SKIP_EXT or now - st.st_mtime < 3:
-                pending += 1
-                continue
             cat = category_of(ext)
-            d = os.path.join(ROOT, cat, datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m"))
+            d = cat_dir(cat, st.st_mtime)
             os.makedirs(d, exist_ok=True)
             os.rename(e.path, free_path(d, e.name))   # 文件仍被占用（下载中）时会失败，稍后重试
             log(f"整理：{e.name} → {cat}")
             moved.append(e.name)
         except OSError:
-            pending += 1
-    return moved, pending
+            later(3)
+    return moved, retry
 
 
 def scan():
@@ -502,49 +809,81 @@ def scan():
         with it:
             for e in it:
                 try:
+                    st = e.stat(follow_symlinks=False)
+                    if is_reparse(st):          # 跳过符号链接和目录联接，不越出下载文件夹
+                        continue
                     if e.is_dir(follow_symlinks=False):
                         walk(e.path, cat)
-                    elif e.is_file():
-                        st = e.stat()
+                    elif e.is_file(follow_symlinks=False):
                         items.append(dict(name=e.name, path=e.path, cat=cat,
                                           ext=os.path.splitext(e.name)[1].lower(),
-                                          size=st.st_size, mtime=st.st_mtime))
+                                          size=st.st_size, mtime=st.st_mtime, arrived=arrived_time(st)))
                 except OSError:
                     pass
 
     for c in CATS:
         p = os.path.join(ROOT, c)
-        if os.path.isdir(p):
-            walk(p, c)
+        try:
+            if os.path.isdir(p) and not is_reparse(os.lstat(p)):
+                walk(p, c)
+        except OSError:
+            pass
     try:
         with os.scandir(ROOT) as it:
             for e in it:
-                if e.is_file():
-                    st = e.stat()
-                    if not st.st_file_attributes & 2:
+                if e.is_file(follow_symlinks=False):
+                    st = e.stat(follow_symlinks=False)
+                    if not st.st_file_attributes & 2 and not is_reparse(st):
                         items.append(dict(name=e.name, path=e.path, cat="未整理",
                                           ext=os.path.splitext(e.name)[1].lower(),
-                                          size=st.st_size, mtime=st.st_mtime))
+                                          size=st.st_size, mtime=st.st_mtime, arrived=arrived_time(st)))
     except OSError:
         pass
     return items, dirs
 
 
+def arrived_time(st):
+    """文件落到这台电脑的时间。解压 / 部分下载工具会保留原始修改时间，
+    只看修改时间会把刚下载的“老文件”当成旧文件清理掉；同卷移动不改变创建时间。"""
+    birth = getattr(st, "st_birthtime", None)
+    if birth is None:
+        birth = st.st_ctime            # Windows 上 Python < 3.12 的 st_ctime 即创建时间
+    return max(birth, st.st_mtime)
+
+
 def remove_empty_dirs():
+    """自底向上删除分类文件夹里的空子文件夹；不进入符号链接 / 目录联接。"""
     for c in CATS:
-        for dp, dn, fn in sorted(os.walk(os.path.join(ROOT, c)), key=lambda x: -len(x[0])):
-            if dp != os.path.join(ROOT, c):
-                try:
-                    if not os.listdir(dp):
-                        os.rmdir(dp)
-                except OSError:
-                    pass
+        base = os.path.join(ROOT, c)
+        try:
+            if not os.path.isdir(base) or is_reparse(os.lstat(base)):
+                continue
+        except OSError:
+            continue
+        stack = []
+
+        def collect(d):
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        if e.is_dir(follow_symlinks=False) and not is_reparse(e.stat(follow_symlinks=False)):
+                            stack.append(e.path)
+                            collect(e.path)
+            except OSError:
+                pass
+        collect(base)
+        for dp in sorted(stack, key=len, reverse=True):
+            try:
+                if not os.listdir(dp):
+                    os.rmdir(dp)
+            except OSError:
+                pass
 
 
 def move_to(path, dest):
     name = os.path.basename(path)
     if dest in CATS:
-        d = os.path.join(ROOT, dest, datetime.fromtimestamp(os.stat(path).st_mtime).strftime("%Y-%m"))
+        d = cat_dir(dest, os.stat(path).st_mtime)
     else:
         d = dest
     os.makedirs(d, exist_ok=True)
@@ -553,32 +892,58 @@ def move_to(path, dest):
 
 
 def cleanup(cfg):
-    n, freed = 0, 0
+    """把符合规则的文件移到回收站。返回 (文件数, 释放字节数, 提示信息列表)。
+    安全措施：只删分类文件夹内的普通文件；放不进回收站的文件跳过（绝不永久删除）；
+    容量阈值无法达到时不删任何文件。"""
+    cfg = sanitize_cfg(cfg)
+    n, freed, notes, skipped = 0, 0, [], 0
+    items = scan()[0]
+    protect = set(cfg["protect"])
+    eligible = sorted((x for x in items if x["cat"] != "未整理" and x["cat"] not in protect),
+                      key=lambda x: x["arrived"])
+    gone = set()
 
-    def eligible():
-        return sorted((x for x in scan()[0] if x["cat"] != "未整理" and x["cat"] not in cfg["protect"]),
-                      key=lambda x: x["mtime"])
+    def remove(x):
+        nonlocal n, freed, skipped
+        if not inside_managed(x["path"]) or not can_recycle(x["path"], x["size"]):
+            skipped += 1
+            log(f"清理跳过（无法放入回收站或不在管理范围内）：{x['name']}")
+            return False
+        try:
+            recycle([x["path"]])
+        except OSError:
+            skipped += 1
+            return False
+        n += 1; freed += x["size"]; gone.add(x["path"])
+        log(f"清理：{x['name']}")
+        return True
+
     if cfg["clean_on"]:
         cutoff = time.time() - cfg["clean_days"] * 86400
-        old = [x for x in eligible() if x["mtime"] < cutoff]
-        for x in old:
-            try:
-                recycle([x["path"]]); n += 1; freed += x["size"]
-            except OSError:
-                pass
+        for x in eligible:
+            if x["arrived"] < cutoff:
+                remove(x)
     if cfg["cap_on"]:
-        total = sum(x["size"] for x in scan()[0])
         cap = cfg["cap_gb"] * 1024 ** 3
-        for x in eligible():
-            if total <= cap:
-                break
-            try:
-                recycle([x["path"]]); n += 1; freed += x["size"]; total -= x["size"]
-            except OSError:
-                pass
+        total = sum(x["size"] for x in items if x["path"] not in gone)
+        rest = [x for x in eligible if x["path"] not in gone]
+        fixed = total - sum(x["size"] for x in rest)    # 受保护 / 未整理的文件，不会被删除
+        if total > cap and fixed >= cap:
+            # 就算把可清理的文件全删掉也降不到阈值以下：一个都不删，提醒用户
+            msg = (f"受保护和未整理的文件已有 {human(fixed)}，超过容量阈值 {cfg['cap_gb']:g} GB，"
+                   f"已跳过容量清理，请调高阈值或减少受保护分类")
+            log(msg); notes.append(msg)
+        else:
+            for x in rest:
+                if total <= cap:
+                    break
+                if remove(x):
+                    total -= x["size"]
     remove_empty_dirs()
-    log(f"清理：{n} 个文件进回收站，释放 {human(freed)}")
-    return n, freed
+    if skipped:
+        notes.append(f"{skipped} 个文件无法放入回收站，已跳过（不会被永久删除）")
+    log(f"清理：{n} 个文件进回收站，释放 {human(freed)}" + (f"，跳过 {skipped} 个" if skipped else ""))
+    return n, freed, notes
 
 
 # ---------------- 控件 ----------------
@@ -678,6 +1043,23 @@ class SideButton(QPushButton):
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text_)
 
 
+class CleanupWorker(QThread):
+    """在后台线程执行清理：扫描 + 逐个移入回收站可能要几秒到几十秒，不能卡住界面。"""
+    done = pyqtSignal(int, object, list)      # 文件数, 释放字节（可能超过 32 位）, 提示
+
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = dict(cfg)                  # 用快照，避免运行中被界面修改
+
+    def run(self):
+        try:
+            n, freed, notes = cleanup(self.cfg)
+        except Exception as e:                # 后台线程里的异常不能悄悄吞掉
+            log(f"清理出错：{e}")
+            n, freed, notes = 0, 0, [f"清理出错：{e}"]
+        self.done.emit(n, freed, notes)
+
+
 class ThumbLoader(QThread):
     """后台生成图片缩略图，并缓存到磁盘（按路径 + 修改时间），下次打开直接读取小图。"""
     ready = pyqtSignal(str, QImage)
@@ -689,6 +1071,22 @@ class ThumbLoader(QThread):
         os.makedirs(self.cache_dir, exist_ok=True)
         self.q, self.lock, self.cv = [], threading.Lock(), threading.Condition()
 
+    MAX_FILES = 3000      # 缓存上限；超过后删掉最久没用的，降到 2000 个
+
+    def prune(self):
+        try:
+            files = [e for e in os.scandir(self.cache_dir) if e.is_file() and e.name.endswith(".png")]
+            if len(files) <= self.MAX_FILES:
+                return
+            files.sort(key=lambda e: e.stat().st_mtime)
+            for e in files[:len(files) - self.MAX_FILES * 2 // 3]:
+                try:
+                    os.remove(e.path)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
     def request(self, key, path):
         with self.cv:
             self.q.append((key, path))
@@ -699,6 +1097,7 @@ class ThumbLoader(QThread):
             self.q.clear()
 
     def run(self):
+        self.prune()
         while True:
             with self.cv:
                 while not self.q:
@@ -706,8 +1105,13 @@ class ThumbLoader(QThread):
                 key, path = self.q.pop(0)
             if key is None:
                 return
-            cache = os.path.join(self.cache_dir, hashlib.md5(key.encode("utf-8")).hexdigest() + ".png")
+            cache = os.path.join(self.cache_dir, hashlib.md5(key.encode("utf-8"), usedforsecurity=False).hexdigest() + ".png")
             img = QImage(cache) if os.path.exists(cache) else QImage()
+            if not img.isNull():
+                try:
+                    os.utime(cache)        # 记录最近使用，清理缓存时保留常用的
+                except OSError:
+                    pass
             if img.isNull():
                 r = QImageReader(path)
                 r.setAutoTransform(True)
@@ -716,6 +1120,10 @@ class ThumbLoader(QThread):
                     sz.scale(self.SIZE, self.SIZE, Qt.AspectRatioMode.KeepAspectRatio)
                     r.setScaledSize(sz)
                 img = r.read()
+                # 立即释放读取器：否则它会一直打开着这张图片，直到下一次请求，
+                # 期间用户无法重命名 / 移动 / 删除这个文件（或其所在文件夹）
+                r.setFileName("")
+                del r
                 if img.isNull():
                     continue
                 if max(img.width(), img.height()) > self.SIZE:
@@ -969,7 +1377,7 @@ class Main(QWidget):
         sl.addStretch()
         item("", "立即整理", lambda: self.do_organize(True))
         item("", "立即清理", self.do_cleanup)
-        item("", "打开下载文件夹", lambda: os.startfile(ROOT))
+        item("", "打开管理的文件夹" if self.cfg.get("root") else "打开下载文件夹", lambda: os.startfile(ROOT))
         self.btn_appear = item("", "外观", self.open_appearance, True)
         self.btn_settings = item("", "设置", self.open_settings, True)
         mid.addWidget(self.side)
@@ -1214,8 +1622,40 @@ class Main(QWidget):
         self.s_auto = Switch()
         self.s_auto.setChecked(self.cfg["auto"])
         self.s_auto.toggled.connect(lambda on: self.set_cfg("auto", on))
-        row(c, "有新文件下载到“下载”文件夹时自动整理", self.s_auto,
-            sub="按类型放进 重要文件 / 安装包 / 压缩包 / 图片 … 文件夹，再按“年-月”分子文件夹；未下载完的文件会跳过")
+        row(c, "管理的文件夹里出现新文件时自动整理" if self.cfg.get("root") else "有新文件下载到“下载”文件夹时自动整理",
+            self.s_auto,
+            sub="按下方“分类规则”放进 " + " / ".join(CATS[:4]) + (" …" if len(CATS) > 4 else "")
+                + " 等文件夹；未下载完的文件会跳过")
+        self.s_settle = QSpinBox(minimum=3, maximum=600, suffix=" 秒")
+        self.s_settle.setValue(int(self.cfg["settle_sec"]))
+        self.s_settle.valueChanged.connect(lambda x: self.set_cfg("settle_sec", x))
+        row(c, "下载完成后等待多久再整理", self.s_settle,
+            sub="留出时间在浏览器里直接“打开”或“在文件夹中显示”刚下载的文件")
+        self.s_month = Switch()
+        self.s_month.setChecked(bool(self.cfg["by_month"]))
+        self.s_month.toggled.connect(self.set_by_month)
+        row(c, "按“年-月”分子文件夹", self.s_month, sub="关闭后直接放在分类文件夹里；已经整理好的文件保持不变")
+
+        c = card("分类规则", "按扩展名把文件放进对应分类，扩展名用空格或逗号分隔；没有匹配的文件放进“其他文件”。"
+                         "改名会同时重命名对应的文件夹；删除分类不会删除文件夹和里面的文件。保存后自动重启生效。")
+        self.rules_box = QVBoxLayout()
+        self.rules_box.setSpacing(6)
+        c.addLayout(self.rules_box)
+        self.rule_rows = []
+        for name, _, exts in RULES:
+            self.add_rule_row(name, exts, name)
+        hb = QHBoxLayout()
+        b_add = QPushButton("添加分类")
+        b_add.clicked.connect(lambda: self.add_rule_row("", "", None))
+        b_def = QPushButton("恢复默认规则")
+        b_def.clicked.connect(self.reset_rules)
+        b_save = QPushButton("保存并重启", objectName="primary")
+        b_save.clicked.connect(self.save_rules)
+        for b in (b_add, b_def):
+            hb.addWidget(b)
+        hb.addStretch()
+        hb.addWidget(b_save)
+        c.addLayout(hb)
 
         c = card("自动清理", "清理的文件进入回收站，可以还原；后台每 30 分钟检查一次。")
         self.s_clean = Switch()
@@ -1224,7 +1664,7 @@ class Main(QWidget):
         self.s_days.setValue(int(self.cfg["clean_days"]))
         self.s_clean.toggled.connect(lambda on: self.set_cfg("clean_on", on))
         self.s_days.valueChanged.connect(lambda x: self.set_cfg("clean_days", x))
-        row(c, "定期清理旧文件", self.s_days, self.s_clean, sub="删除修改时间早于设定天数的文件")
+        row(c, "定期清理旧文件", self.s_days, self.s_clean, sub="清理下载到本机超过设定天数的文件（按到达时间，不受文件原始修改时间影响）")
         self.s_cap = Switch()
         self.s_cap.setChecked(self.cfg["cap_on"])
         self.s_gb = QDoubleSpinBox(minimum=0.5, maximum=10000, singleStep=0.5, decimals=1, suffix=" GB")
@@ -1260,7 +1700,13 @@ class Main(QWidget):
         cb.setCurrentIndex(0 if self.cfg["close"] == "tray" else 1)
         cb.currentIndexChanged.connect(lambda i: self.set_cfg("close", "tray" if i == 0 else "quit"))
         row(c, "点击 ✕ 关闭窗口时", cb)
-        row(c, "下载文件夹位置", QLabel(ROOT, objectName="hint"))
+        b_root = QPushButton("更改…")
+        b_root.clicked.connect(lambda: self.choose_root(False))
+        b_rdef = QPushButton("恢复为“下载”")
+        b_rdef.setEnabled(bool(self.cfg["root"]))
+        b_rdef.clicked.connect(lambda: self.choose_root(True))
+        row(c, "管理的文件夹", b_root, b_rdef,
+            sub=ROOT + ("" if self.cfg["root"] else "（系统“下载”文件夹）"))
 
         c = card("最近记录")
         self.log_view = QTextBrowser()
@@ -1308,6 +1754,119 @@ class Main(QWidget):
                 if s.isChecked() != v:
                     s.blockSignals(True); s.setChecked(v); s.blockSignals(False)
             self.st_auto.setText("已开启" if v else "已关闭")
+
+    # ---------- 可配置：分类规则 / 管理的文件夹 ----------
+    def set_by_month(self, on):
+        global BY_MONTH
+        BY_MONTH = bool(on)
+        self.set_cfg("by_month", bool(on))
+
+    def add_rule_row(self, name, exts, orig):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        n = QLineEdit(name, placeholderText="分类名")
+        n.setFixedWidth(130)
+        e = QLineEdit(" ".join(x.lstrip(".") for x in exts.split()), placeholderText="扩展名，例如 pdf docx txt")
+        rm = QPushButton("删除")
+        rm.setCursor(Qt.CursorShape.PointingHandCursor)
+        h.addWidget(n)
+        h.addWidget(e, 1)
+        h.addWidget(rm)
+        rec = dict(w=w, name=n, exts=e, orig=orig)
+
+        def remove():
+            if rec in self.rule_rows:
+                self.rule_rows.remove(rec)
+            w.deleteLater()
+        rm.clicked.connect(remove)
+        self.rules_box.addWidget(w)
+        self.rule_rows.append(rec)
+        if not name:
+            n.setFocus()
+
+    def reset_rules(self):
+        for r in list(self.rule_rows):
+            r["w"].deleteLater()
+        self.rule_rows.clear()
+        for name, _, exts in DEFAULT_RULES:
+            self.add_rule_row(name, exts, name if name in CATS else None)
+
+    def save_rules(self):
+        rows = [(r["name"].text(), r["exts"].text()) for r in self.rule_rows]
+        norm, err = validate_rules(rows)
+        if err:
+            self.show_toast(err)
+            return
+        names = [n for n, _ in norm]
+        renames = [(r["orig"], n) for r, n in zip(self.rule_rows, names) if r["orig"] and r["orig"] != n]
+        renamed_from = {o for o, _ in renames}
+        removed = [c for c in CATS if c != OTHER and c not in names and c not in renamed_from]
+        msg = "保存分类规则并重启下载管家？"
+        if renames:
+            msg += "\n\n将重命名文件夹：" + "、".join(f"{o} → {n}" for o, n in renames)
+        if removed:
+            msg += "\n\n删除的分类：" + "、".join(removed) + "\n（文件夹和里面的文件保留原样，只是不再显示和清理）"
+        if not Dialog(self, "分类规则", msg, ok="保存并重启").exec():
+            return
+        # 文件夹监视会占用目录句柄，Windows 下被监视的文件夹无法改名：先全部释放
+        if renames and self.watcher.directories():
+            self.watcher.removePaths(self.watcher.directories())
+        for o, n in renames:
+            src, dst = os.path.join(ROOT, o), os.path.join(ROOT, n)
+            try:
+                if os.path.isdir(src) and not is_reparse(os.lstat(src)) and not os.path.exists(dst):
+                    os.rename(src, dst)
+                    log(f"分类改名：{o} → {n}")
+            except OSError as e:
+                log(f"分类文件夹改名失败：{o} → {n}（{e.strerror or e}）")
+        mp = dict(renames)
+        self.cfg["protect"] = [mp.get(p, p) for p in self.cfg["protect"] if mp.get(p, p) in names + [OTHER]]
+        self.cfg["rules"] = [] if norm == [[n, e] for n, _, e in DEFAULT_RULES] else norm
+        save_cfg(self.cfg)
+        self.restart()
+
+    def choose_root(self, reset):
+        if reset:
+            p = ""
+        else:
+            p = QFileDialog.getExistingDirectory(self, "选择要管理的文件夹", ROOT)
+            if not p:
+                return
+            err = root_problem(p)
+            if err:
+                self.show_toast(err)
+                return
+            p = os.path.abspath(p)
+        target = p or downloads_dir()
+        if _norm(target) == _norm(ROOT):
+            self.show_toast("已经在管理这个文件夹")
+            return
+        if Dialog(self, "更改管理的文件夹",
+                  f"改为管理：\n{target}\n\n开启自动整理时，这个文件夹最外层的文件会被移进分类文件夹；"
+                  f"原来文件夹里已整理的文件保持不动。保存并重启？", ok="保存并重启").exec():
+            self.cfg["root"] = p
+            save_cfg(self.cfg)
+            self.restart()
+
+    def restart(self):
+        """重启自身使设置生效：先释放单实例通道，否则新进程会把自己当成“第二个实例”直接退出。"""
+        srv = getattr(self, "server", None)
+        if srv is not None:
+            srv.close()
+        if getattr(sys, "frozen", False):
+            prog, args = sys.executable, []
+        else:
+            prog, args = sys.executable, [os.path.abspath(__file__)]
+        res = QProcess.startDetached(prog, args)
+        ok = res[0] if isinstance(res, tuple) else bool(res)
+        if not ok:
+            if srv is not None:
+                srv.listen(instance_name())
+            self.tick()            # 恢复文件夹监视
+            self.show_toast("设置已保存，但无法自动重启，请手动重新打开下载管家")
+            return
+        self.quit()
 
     def save_protect(self):
         self.set_cfg("protect", [c for c, b in self.protect_boxes.items() if b.isChecked()])
@@ -1607,12 +2166,11 @@ class Main(QWidget):
     def on_fs_settled(self):
         """文件夹变化稳定后：整理新文件；窗口可见才刷新列表，隐藏时只记下“需要刷新”。"""
         if self.cfg["auto"]:
-            moved, pending = organize()
+            moved, retry = organize(self.cfg["settle_sec"])
             if moved and not self.isVisible():
                 self.tray.showMessage(APP, "已整理：" + moved[0] if len(moved) == 1 else f"已整理 {len(moved)} 个新文件",
                                       self.app_icon, 3000)
-            if pending:
-                self.retry_timer.start()
+            self.schedule_retry(retry)
         if self.isVisible():
             self.tick(organize_first=False)
         else:
@@ -1623,11 +2181,18 @@ class Main(QWidget):
         if ROOT not in self.watcher.directories() and os.path.isdir(ROOT):
             self.watcher.addPath(ROOT)
 
+    def schedule_retry(self, sec):
+        """安排下一次整理重试；已有更早的重试就保留更早的。"""
+        if sec is None:
+            return
+        ms = max(500, int(sec * 1000))
+        if not self.retry_timer.isActive() or self.retry_timer.remainingTime() > ms:
+            self.retry_timer.start(ms)
+
     def tick(self, organize_first=True):
         if organize_first and self.cfg["auto"]:
-            _, pending = organize()
-            if pending:
-                self.retry_timer.start()
+            _, retry = organize(self.cfg["settle_sec"])
+            self.schedule_retry(retry)
         items, dirs = scan()
         self.dirty = False
         # 同步监视列表（新建的“年-月”文件夹也要监视）
@@ -1886,7 +2451,7 @@ class Main(QWidget):
     def reveal_selected(self):
         s = self.selected()
         if s:
-            subprocess.Popen(f'explorer /select,"{s[0]}"')
+            reveal_in_explorer(s[0])
 
     def delete_selected(self):
         s = self.selected()
@@ -1914,12 +2479,28 @@ class Main(QWidget):
             new = d.value()
             if not new or new == old:
                 return
-            if any(ch in new for ch in '\\/:*?"<>|'):
-                self.show_toast("文件名不能包含 \\ / : * ? \" < > |")
+            err = bad_filename(new)
+            if err:
+                self.show_toast(err)
                 return
             try:
-                os.rename(s[0], os.path.join(os.path.dirname(s[0]), new))
+                dst = os.path.join(os.path.dirname(s[0]), new)
+                if os.path.exists(dst) and os.path.normcase(dst) != os.path.normcase(s[0]):
+                    self.show_toast("已有同名文件")
+                    return
+                os.rename(s[0], dst)
                 log(f"重命名：{old} → {new}")
+                # 扩展名变了：分类也可能变了，放到新分类里
+                parts = os.path.relpath(s[0], ROOT).split(os.sep)
+                new_cat = category_of(os.path.splitext(new)[1].lower())
+                if len(parts) > 1 and parts[0] in CATS and parts[0] != new_cat and \
+                        os.path.splitext(new)[1].lower() != os.path.splitext(old)[1].lower():
+                    try:
+                        move_to(dst, new_cat)
+                        remove_empty_dirs()
+                        self.show_toast(f"扩展名已改变，已移到“{new_cat}”")
+                    except OSError:
+                        self.show_toast("已重命名，但移到新分类失败")
             except OSError as e:
                 self.show_toast(f"重命名失败：{e.strerror or e}")
             self.tick()
@@ -1970,7 +2551,9 @@ class Main(QWidget):
         m.exec(self.tree.viewport().mapToGlobal(pos))
 
     def do_organize(self, manual=False):
-        moved, _ = organize()
+        # 手动“立即整理”：用户明确要求，只保留 3 秒的最短等待
+        moved, retry = organize(3 if manual else self.cfg["settle_sec"])
+        self.schedule_retry(retry)
         self.tick()
         if manual:
             self.show_toast(f"整理了 {len(moved)} 个文件" if moved else "没有需要整理的文件")
@@ -1987,18 +2570,43 @@ class Main(QWidget):
             rule.append(f"总量超过 {self.cfg['cap_gb']:g} GB 时最旧的文件")
         prot = "、".join(self.cfg["protect"]) or "无"
         if Dialog(self, "立即清理", f"将把 {' 和 '.join(rule)} 移到回收站。\n受保护的分类：{prot}", ok="开始清理", danger=True).exec():
-            n, freed = cleanup(self.cfg)
-            self.tick()
-            self.show_toast(f"清理了 {n} 个文件，释放 {human(freed)}")
-            if self.pages.currentIndex() == 1:
-                self.log_view.setPlainText("\n".join(LOGS))
+            if self.start_cleanup(manual=True):
+                self.show_toast("正在后台清理…")
 
     def auto_cleanup(self):
         if self.cfg["clean_on"] or self.cfg["cap_on"]:
-            n, freed = cleanup(self.cfg)
-            if n:
-                self.tray.showMessage(APP, f"自动清理了 {n} 个文件，释放 {human(freed)}", self.app_icon, 3000)
+            self.start_cleanup(manual=False)
+
+    def start_cleanup(self, manual):
+        """启动后台清理；已有清理在运行时不重复启动。"""
+        w = getattr(self, "_clean_worker", None)
+        if w is not None and w.isRunning():
+            if manual:
+                self.show_toast("清理正在进行中，请稍候")
+            return False
+        w = CleanupWorker(self, self.cfg)
+        w.done.connect(lambda n, freed, notes: self.on_cleanup_done(manual, n, freed, notes))
+        w.finished.connect(w.deleteLater)
+        self._clean_worker = w
+        w.start(QThread.Priority.LowPriority)
+        return True
+
+    def on_cleanup_done(self, manual, n, freed, notes):
+        self._clean_worker = None
+        if manual:
+            self.show_toast(f"清理了 {n} 个文件，释放 {human(freed)}" + ("；" + "；".join(notes) if notes else ""))
+        else:
+            fresh = notes != getattr(self, "_last_clean_notes", None)   # 同样的提醒不每 30 分钟重复弹
+            self._last_clean_notes = notes
+            if n or (notes and fresh):
+                msg = f"自动清理了 {n} 个文件，释放 {human(freed)}" if n else "自动清理未删除文件"
+                self.tray.showMessage(APP, msg + ("\n" + "\n".join(notes) if notes else ""), self.app_icon, 5000)
+        if self.isVisible():
             self.tick()
+        else:
+            self.dirty = True
+        if self.pages.currentIndex() == 1:
+            self.log_view.setPlainText("\n".join(LOGS))
 
     # ---------- 窗口 ----------
     def show_main(self):
@@ -2013,6 +2621,9 @@ class Main(QWidget):
         self.activateWindow()
 
     def quit(self):
+        w = getattr(self, "_clean_worker", None)
+        if w is not None and w.isRunning():
+            w.wait(15000)          # 不在清理途中强行退出
         self.thumbs.stop()
         self.tray.hide()
         QApplication.instance().quit()
@@ -2084,6 +2695,37 @@ class Main(QWidget):
         return super().eventFilter(obj, ev)
 
 
+def current_user_id():
+    """当前用户的 SID（拿不到时退回 域\\用户名）。"""
+    try:
+        adv = ctypes.windll.advapi32
+        k32 = ctypes.windll.kernel32
+        tok = wintypes.HANDLE()
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        adv.OpenProcessToken.argtypes = (wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE))
+        if adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0008, ctypes.byref(tok)):   # TOKEN_QUERY
+            try:
+                need = wintypes.DWORD()
+                adv.GetTokenInformation(tok, 1, None, 0, ctypes.byref(need))            # TokenUser
+                buf = ctypes.create_string_buffer(need.value)
+                if adv.GetTokenInformation(tok, 1, buf, need, ctypes.byref(need)):
+                    psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+                    s = wintypes.LPWSTR()
+                    if adv.ConvertSidToStringSidW(ctypes.c_void_p(psid), ctypes.byref(s)):
+                        v = s.value
+                        k32.LocalFree(s)
+                        return v
+            finally:
+                k32.CloseHandle(tok)
+    except Exception:
+        pass
+    return os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")
+
+
+def instance_name():
+    return "DownloadButler-" + hashlib.sha256(current_user_id().encode("utf-8")).hexdigest()[:16]
+
+
 def main():
     # 命名互斥体：供安装 / 卸载程序检测本程序是否在运行
     ctypes.windll.kernel32.CreateMutexW(None, False, "DownloadButlerMutex")
@@ -2091,16 +2733,21 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP)
     # 单实例：再次启动时唤出已运行的窗口
+    # Windows 命名管道是全机共享的：名字里带上当前用户，避免同一台电脑上不同用户的实例互相“唤出”后退出
+    name = instance_name()
     sock = QLocalSocket()
-    sock.connectToServer("DownloadButler")
+    sock.connectToServer(name)
     if sock.waitForConnected(300):
         sock.write(b"show")
         sock.waitForBytesWritten(300)
         return
-    QLocalServer.removeServer("DownloadButler")
+    QLocalServer.removeServer(name)
     server = QLocalServer()
-    server.listen("DownloadButler")
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)   # 只允许当前用户连接
+    server.listen(name)
+    init_settings(load_cfg())
     w = Main(start_hidden="--min" in sys.argv)
+    w.server = server
     server.newConnection.connect(lambda: (server.nextPendingConnection(), w.show_main()))
     sys.exit(app.exec())
 

@@ -1,6 +1,6 @@
 ﻿; 下载管家 安装包脚本（Inno Setup 6）——由 build.ps1 调用
 #define AppName "下载管家"
-#define AppVersion "2.2.1"
+#define AppVersion "2.3.0"
 #define AppPublisher "RonganBai"
 #define AppExe "DownloadButler.exe"
 #ifndef DistDir

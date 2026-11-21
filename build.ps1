@@ -5,7 +5,7 @@ $root = $PSScriptRoot
 Set-Location $root
 $out = Join-Path $env:LOCALAPPDATA "DownloadButler_build"   # 构建目录放在项目之外
 
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-build.txt
 
 python -m PyInstaller --noconfirm --windowed --name "DownloadButler" `
     --icon "$root\assets\icon.ico" --add-data "$root\assets;assets" `

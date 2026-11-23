@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QLabel, QPushButton,
                              QStackedWidget, QScrollArea, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QTextBrowser,
                              QProgressBar, QSystemTrayIcon, QDialog, QFileDialog, QHeaderView, QSlider)
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 APP = "下载管家"
 CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
 CFG_PATH = os.path.join(CFG_DIR, "config.json")
@@ -909,6 +909,12 @@ def organize_dir(entry, now, settle):
     st = entry.stat(follow_symlinks=False)
     if st.st_file_attributes & 2 or is_reparse(st) or entry.name.startswith((".", "$", "~")):
         return None
+    try:
+        with os.scandir(entry.path) as it:
+            if is_project_dir({x.name.lower() for x in it}):
+                return None                    # 代码项目 / 绿色软件：位置可能被其他东西引用，不搬动
+    except OSError:
+        return None
     sizes, newest, partial, n = dir_profile(entry.path)
     if partial:
         return None                            # 里面还有没下载完的文件：等它下载完，监视会再次触发
@@ -988,79 +994,103 @@ def _same_content(a, b, size):
     return h[0] == h[1]
 
 
-def find_junk(protect=()):
+PROJECT_DIR_MARKERS = {".git", ".svn", ".hg", ".venv", "venv", "env", "node_modules", ".idea", ".vscode", ".gradle",
+                       "site-packages", "__pycache__"}
+PROJECT_FILE_MARKERS = {"package.json", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "pipfile",
+                        "cargo.toml", "go.mod", "pom.xml", "build.gradle", "cmakelists.txt", "makefile", "gemfile",
+                        "composer.json", "pubspec.yaml", ".gitignore"}
+PROJECT_FILE_SUFFIX = (".sln", ".csproj", ".vcxproj", ".xcodeproj", ".uproject", ".pyproj")
+
+
+def is_project_dir(names):
+    """文件夹看起来是代码项目或程序目录：里面的空文件夹、0 字节文件往往是必需的结构，整个不碰。
+    names 为该文件夹里条目名（小写）的集合。"""
+    if names & PROJECT_DIR_MARKERS or names & PROJECT_FILE_MARKERS:
+        return True
+    if any(n.endswith(PROJECT_FILE_SUFFIX) for n in names):
+        return True
+    exts = {os.path.splitext(n)[1] for n in names}
+    return ".dll" in exts and ".exe" in exts            # 解压出来的绿色软件
+
+
+def find_junk(protect=(), stats=None):
     """扫描整个管理文件夹（含散落的子文件夹）里的垃圾文件。
     返回 [dict(path, size, reason)]；不删除任何东西，交给用户确认。
-    重复副本只认“同一文件夹里、文件名带 (1) / 副本 / copy、内容与原文件完全相同”的那一份。"""
+    - 代码项目 / 程序文件夹整个跳过（数量记在 stats["projects"]）。
+    - “空文件夹”和“0 字节文件”只在管理文件夹本层、分类文件夹及其“年-月”子文件夹这几层判断，
+      不深入用户自己的文件夹结构（那里的空目录可能是有意保留的）。
+    - 重复副本只认“同一文件夹里、文件名带 (1) / 副本 / copy、内容与原文件完全相同”的那一份。"""
     now = time.time()
-    out = []
-    protect_dirs = [_norm(os.path.join(ROOT, c)) + os.sep for c in protect]
+    out, empty_dirs = [], []
+    stats = stats if stats is not None else {}
+    stats.update(projects=0, files=0, dirs=0)
+    cat_lower = {c.lower(): c for c in CATS}
+    protect_lower = {c.lower() for c in protect}
 
-    def protected(p):
-        n = _norm(p) + os.sep
-        return any(n.startswith(d) for d in protect_dirs)
-
-    def walk(d, depth):
+    def walk(d, level, prot):
+        """level：root / cat / month / other。返回该文件夹是否“完全为空”（没有任何文件，子文件夹也都为空）。"""
+        stats["dirs"] += 1
         try:
             with os.scandir(d) as it:
-                entries = list(it)
+                entries = []
+                for e in it:
+                    try:
+                        entries.append((e, e.stat(follow_symlinks=False)))
+                    except OSError:
+                        pass
         except OSError:
-            return True
-        files = {}
-        for e in entries:
-            try:
-                st = e.stat(follow_symlinks=False)
-                if not is_reparse(st) and e.is_file(follow_symlinks=False):
-                    files[e.name.lower()] = (e, st)
-            except OSError:
-                pass
+            return False
+        names = {e.name.lower() for e, _ in entries}
+        if level == "other" and is_project_dir(names):
+            stats["projects"] += 1
+            return False
+        structural = level in ("root", "cat", "month")     # 只有这几层允许判断空文件夹 / 空文件
+        files = {e.name.lower(): (e, st) for e, st in entries
+                 if not is_reparse(st) and e.is_file(follow_symlinks=False)}
         empty = True
-        for e in entries:
-            try:
-                st = e.stat(follow_symlinks=False)
-                if is_reparse(st):
+        for e, st in entries:
+            if is_reparse(st):
+                empty = False
+                continue
+            low = e.name.lower()
+            if e.is_dir(follow_symlinks=False):
+                if low == "__macosx":
                     empty = False
+                    out.append(dict(path=e.path, size=dir_size(e.path), reason="macOS 压缩包残留（__MACOSX 文件夹）"))
                     continue
-                if e.is_dir(follow_symlinks=False):
-                    if e.name.lower() == "__macosx":
-                        empty = False
-                        out.append(dict(path=e.path, size=dir_size(e.path), reason="macOS 压缩包残留（__MACOSX 文件夹）"))
-                        continue
-                    sub_empty = walk(e.path, depth + 1)
-                    is_cat_top = depth == 0 and e.name.lower() in {c.lower() for c in CATS}
-                    if sub_empty and not is_cat_top and now - st.st_mtime > DAY and not protected(e.path):
-                        empty_dirs.append(e.path)
-                    else:
-                        empty = False
-                    continue
-                empty = False
-                r = junk_reason(e.name, st, now)
-                if r and r.startswith("空文件") and protected(e.path):
-                    r = None
-                if r is None and not protected(e.path) and st.st_size > 0:
-                    base, ext = os.path.splitext(e.name)
-                    m = _COPY_RE.match(base)
-                    orig = files.get((m.group(1) + ext).lower()) if m and m.group(1) else None
-                    if orig and orig[0].path != e.path and orig[1].st_size == st.st_size:
-                        try:
-                            if _same_content(orig[0].path, e.path, st.st_size):
-                                r = f"重复下载的副本（与“{orig[0].name}”内容完全相同）"
-                        except OSError:
-                            pass
-                if r:
-                    out.append(dict(path=e.path, size=st.st_size, reason=r))
-            except OSError:
-                empty = False
+                if level == "root" and low in cat_lower:
+                    sub_level, sub_prot = "cat", low in protect_lower
+                elif level == "cat" and re.fullmatch(r"\d{4}-\d{2}", e.name):
+                    sub_level, sub_prot = "month", prot
+                else:
+                    sub_level, sub_prot = "other", prot
+                sub_empty = walk(e.path, sub_level, sub_prot)
+                if sub_empty and structural and sub_level != "cat" and not prot and now - st.st_mtime > DAY:
+                    empty_dirs.append(e.path)
+                if not sub_empty or sub_level == "cat":
+                    empty = False
+                continue
+            empty = False
+            stats["files"] += 1
+            r = junk_reason(e.name, st, now)
+            if r and r.startswith("空文件") and (prot or not structural):
+                r = None
+            if r is None and not prot and st.st_size > 0:
+                base, ext = os.path.splitext(e.name)
+                m = _COPY_RE.match(base)
+                orig = files.get((m.group(1) + ext).lower()) if m and m.group(1) else None
+                if orig and orig[0].path != e.path and orig[1].st_size == st.st_size:
+                    try:
+                        if _same_content(orig[0].path, e.path, st.st_size):
+                            r = f"重复下载的副本（与“{orig[0].name}”内容完全相同）"
+                    except OSError:
+                        pass
+            if r:
+                out.append(dict(path=e.path, size=st.st_size, reason=r))
         return empty
 
-    empty_dirs = []
-    walk(ROOT, 0)
-    # 嵌套的空文件夹只列最外层那个（删掉它就连里面的一起删了）
-    tops = set(map(_norm, empty_dirs))
-    for p in empty_dirs:
-        parent = _norm(os.path.dirname(p))
-        if parent not in tops:
-            out.append(dict(path=p, size=0, reason="空文件夹"))
+    walk(ROOT, "root", False)
+    out.extend(dict(path=p, size=0, reason="空文件夹") for p in empty_dirs)
     return out
 
 
@@ -1096,18 +1126,43 @@ def inside_root(path):
 def delete_junk(items):
     """把确认过的垃圾文件移入回收站。放不进回收站的跳过。返回 (删除数, 释放字节, 跳过数)。"""
     n, freed, skipped = 0, 0, 0
+    limits, ok = {}, []
     for x in items:
         p = x["path"]
-        if not inside_root(p) or not can_recycle(p, x["size"]):
+        drive = os.path.splitdrive(os.path.abspath(p))[0].lower()
+        if drive not in limits:                       # 回收站容量按磁盘只查一次
+            limits[drive] = recycle_limit(p)
+        if not inside_root(p) or not (0 < x["size"] < limits[drive] or (x["size"] == 0 and limits[drive] > 0)):
             skipped += 1
             continue
+        ok.append(x)
+
+    def done(x):
+        nonlocal n, freed
+        n += 1
+        freed += x["size"]
+        log(f"清理垃圾：{os.path.relpath(x['path'], ROOT)}（{x['reason']}）")
+
+    # 一次交给系统一批（逐个调用时每次都有几百毫秒开销）；某一批失败时再逐个处理，找出失败的那几个
+    for i in range(0, len(ok), 200):
+        chunk = ok[i:i + 200]
         try:
-            recycle([p])
-            n += 1
-            freed += x["size"]
-            log(f"清理垃圾：{os.path.relpath(p, ROOT)}（{x['reason']}）")
+            recycle([x["path"] for x in chunk])
+            for x in chunk:
+                if os.path.lexists(x["path"]):
+                    skipped += 1
+                else:
+                    done(x)
         except OSError:
-            skipped += 1
+            for x in chunk:
+                if not os.path.lexists(x["path"]):
+                    done(x)
+                    continue
+                try:
+                    recycle([x["path"]])
+                    done(x)
+                except OSError:
+                    skipped += 1
     remove_empty_dirs()
     return n, freed, skipped
 
@@ -1374,6 +1429,22 @@ class CleanupWorker(QThread):
             log(f"清理出错：{e}")
             n, freed, notes = 0, 0, [f"清理出错：{e}"]
         self.done.emit(n, freed, notes)
+
+
+class TaskWorker(QThread):
+    """在后台线程里运行一个函数，完成后通过 done 信号把结果（或异常）交回界面线程。"""
+    done = pyqtSignal(object, object)         # 结果, 异常（无异常时为 None）
+
+    def __init__(self, parent, fn):
+        super().__init__(parent)
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self.fn(), None)
+        except Exception as e:
+            log(f"后台任务出错：{e}")
+            self.done.emit(None, e)
 
 
 class ThumbLoader(QThread):
@@ -2949,14 +3020,40 @@ class Main(QWidget):
         self.tick()
         self.show_toast(f"已重新整理 {len(plan) - bad} 个文件" + (f"，{bad} 个失败（可能正在使用）" if bad else ""))
 
+    def run_task(self, key, fn, on_done):
+        """后台运行 fn；同一个 key 的任务正在运行时不重复启动。返回是否已启动。"""
+        tasks = self.__dict__.setdefault("_tasks", {})
+        w = tasks.get(key)
+        if w is not None and w.isRunning():
+            return False
+        w = TaskWorker(self, fn)
+
+        def finish(res, err):
+            tasks.pop(key, None)
+            on_done(res, err)
+        w.done.connect(finish)
+        w.finished.connect(w.deleteLater)
+        tasks[key] = w
+        w.start(QThread.Priority.LowPriority)
+        return True
+
     def clean_junk(self):
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            junk = find_junk(self.cfg["protect"])
-        finally:
-            QApplication.restoreOverrideCursor()
+        stats = {}
+        protect = list(self.cfg["protect"])
+        if not self.run_task("junk", lambda: find_junk(protect, stats),
+                             lambda res, err: self.on_junk_scanned(res, err, stats)):
+            self.show_toast("正在扫描垃圾文件，请稍候…")
+            return
+        self.show_toast("正在后台扫描垃圾文件，可以继续使用…")
+
+    def on_junk_scanned(self, junk, err, stats):
+        if err is not None:
+            self.show_toast(f"扫描失败：{err}")
+            return
+        skipped = (f"已跳过 {stats.get('projects', 0)} 个代码项目 / 程序文件夹（里面的内容不会动）。"
+                   if stats.get("projects") else "")
         if not junk:
-            self.show_toast("没有发现垃圾文件")
+            self.show_toast("没有发现垃圾文件" + ("；" + skipped if skipped else ""))
             return
         tree = QTreeWidget()
         tree.setHeaderLabels(["文件", "大小"])
@@ -2965,13 +3062,14 @@ class Main(QWidget):
         tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         groups = {}
         for x in junk:
-            g = groups.get(x["reason"].split("（与“")[0])
+            key = x["reason"].split("（与“")[0]
+            g = groups.get(key)
             if g is None:
-                g = QTreeWidgetItem(tree, [x["reason"].split("（与“")[0], ""])
+                g = QTreeWidgetItem(tree, [key, ""])
                 g.setFlags(g.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsAutoTristate)
                 g.setCheckState(0, Qt.CheckState.Checked)
                 g.total = 0
-                groups[x["reason"].split("（与“")[0]] = g
+                groups[key] = g
             it = QTreeWidgetItem(g, [os.path.relpath(x["path"], ROOT), human(x["size"])])
             it.setToolTip(0, x["reason"] + "\n" + x["path"])
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -2983,7 +3081,7 @@ class Main(QWidget):
             g.setText(1, human(g.total))
         total = sum(x["size"] for x in junk)
         d = Dialog(self, "清理垃圾文件",
-                   f"在 {ROOT} 及其子文件夹里找到 {len(junk)} 项可以清理的内容，共 {human(total)}。"
+                   f"在 {ROOT} 里找到 {len(junk)} 项可以清理的内容，共 {human(total)}。{skipped}"
                    "取消勾选可以保留；确认后移入回收站，可以还原。", ok="移到回收站", danger=True, extra=tree)
         if not d.exec():
             return
@@ -2996,7 +3094,14 @@ class Main(QWidget):
                     chosen.append(c.junk)
         if not chosen:
             return
-        n, freed, skipped = delete_junk(chosen)
+        self.show_toast(f"正在把 {len(chosen)} 项移到回收站…")
+        self.run_task("junk_delete", lambda: delete_junk(chosen), self.on_junk_deleted)
+
+    def on_junk_deleted(self, res, err):
+        if err is not None:
+            self.show_toast(f"清理失败：{err}")
+            return
+        n, freed, skipped = res
         self.tick()
         self.show_toast(f"清理了 {n} 项垃圾，释放 {human(freed)}"
                         + (f"；{skipped} 项无法放入回收站，已跳过" if skipped else ""))
@@ -3067,6 +3172,9 @@ class Main(QWidget):
         w = getattr(self, "_clean_worker", None)
         if w is not None and w.isRunning():
             w.wait(15000)          # 不在清理途中强行退出
+        for t in list(self.__dict__.get("_tasks", {}).values()):
+            if t.isRunning():
+                t.wait(15000)
         self.thumbs.stop()
         self.tray.hide()
         QApplication.instance().quit()

@@ -85,7 +85,15 @@ def init_and_uncheck(self, *a, **k):
             if "macOS" in g.text(0):
                 g.setCheckState(0, dm.Qt.CheckState.Unchecked)
 dm.Dialog.__init__ = init_and_uncheck
+import time as _t
 w.clean_junk()
+assert w.__dict__.get("_tasks"), "junk scan should run in background"
+w.clean_junk()                                     # 扫描中再点一次：不重复启动
+assert len(w._tasks) == 1
+deadline = _t.time() + 20
+while w._tasks and _t.time() < deadline:           # 等后台扫描 → 弹窗确认 → 后台删除 全部完成
+    app.processEvents(); _t.sleep(0.02)
+assert not w._tasks, "background junk tasks did not finish"
 dm.Dialog.__init__ = orig_init
 assert gone == ["Thumbs.db"], gone
 assert os.path.exists(os.path.join(dm.ROOT, "散落", "._a.jpg"))

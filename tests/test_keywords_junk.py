@@ -81,15 +81,26 @@ keep = [mk("图片/2024-01/a.jpg", b"img"), mk("散落/readme.txt", b"hi"), mk("
         mk("散落/new.tmp", b"t", days=0), mk("散落/~$recent.docx", b"l", days=0),   # 太新：保留
         mk("散落/going.crdownload", b"p", days=2), mk("重要文件/空.txt", b"", days=5)]  # 受保护分类里的空文件：保留
 junk = [mk("散落/Thumbs.db", b"x"), mk("散落/._photo.jpg", b"x" * 100), mk("散落/~$old.docx", b"x" * 160),
-        mk("散落/old.tmp", b"x"), mk("散落/stale.crdownload", b"x" * 10, days=10), mk("散落/zero.bin", b""),
+        mk("散落/old.tmp", b"x"), mk("散落/stale.crdownload", b"x" * 10, days=10), mk("zero.bin", b""),
         mk("散落/data.zip", b"SAME"), mk("散落/data (1).zip", b"SAME"), mk("散落/data - 副本.zip", b"SAME"),
         mk("压缩包解压/__MACOSX/._x", b"x" * 50)]
 os.makedirs(os.path.join(dm.ROOT, "空的", "更深", "最深")); set_times(os.path.join(dm.ROOT, "空的"), 3)
 set_times(os.path.join(dm.ROOT, "空的", "更深"), 3); set_times(os.path.join(dm.ROOT, "空的", "更深", "最深"), 3)
 os.makedirs(os.path.join(dm.ROOT, "视频")); set_times(os.path.join(dm.ROOT, "视频"), 3)   # 分类顶层文件夹：保留
-found = {os.path.relpath(x["path"], dm.ROOT): x for x in dm.find_junk(protect=["重要文件"])}
+# 用户自己的文件夹深处：空子文件夹、0 字节文件都保留（可能是有意的结构）
+keep += [mk("散落/notes/empty.txt", b"")]
+os.makedirs(os.path.join(dm.ROOT, "散落", "空子", "更深")); set_times(os.path.join(dm.ROOT, "散落", "空子"), 3)
+# 代码项目 / 绿色软件：整个不碰，包括里面的 Thumbs.db、空 __init__.py、空文件夹、.tmp
+keep += [mk("MyProj/.gitignore", b"x"), mk("MyProj/pkg/__init__.py", b""), mk("MyProj/Thumbs.db", b"x"),
+         mk("MyProj/old.tmp", b"x"), mk("Tool/app.exe", b"x"), mk("Tool/core.dll", b"x"), mk("Tool/cfg/__init__.py", b"")]
+os.makedirs(os.path.join(dm.ROOT, "MyProj", "logs")); set_times(os.path.join(dm.ROOT, "MyProj", "logs"), 3)
+keep += [mk("Venv/.venv/Lib/site-packages/x/__init__.py", b"")]
+stats = {}
+found = {os.path.relpath(x["path"], dm.ROOT): x for x in dm.find_junk(protect=["重要文件"], stats=stats)}
+check(f"project/program folders skipped (stats={stats})", stats.get("projects") == 3)
+check("nothing inside projects listed", not any(k.split(os.sep)[0] in ("MyProj", "Tool", "Venv") for k in found))
 expect = {"散落\\Thumbs.db", "散落\\._photo.jpg", "散落\\~$old.docx", "散落\\old.tmp", "散落\\stale.crdownload",
-          "散落\\zero.bin", "散落\\data (1).zip", "散落\\data - 副本.zip", "压缩包解压\\__MACOSX", "空的"}
+          "zero.bin", "散落\\data (1).zip", "散落\\data - 副本.zip", "压缩包解压\\__MACOSX", "空的"}
 check("junk found exactly", set(found) == expect)
 if set(found) != expect:
     print("   extra:", set(found) - expect, " missing:", expect - set(found))
@@ -120,6 +131,9 @@ check("folder moved by majority type (junk ignored)", os.path.isfile(os.path.joi
 check("recent folder waits", os.path.isdir(os.path.join(dm.ROOT, "解压中")) and retry is not None and retry > 50)
 check("folder with partial download skipped", os.path.isdir(os.path.join(dm.ROOT, "下载中")))
 check("junk-only folder left for junk cleaner", os.path.isdir(os.path.join(dm.ROOT, "只有垃圾")))
+mk("项目A/package.json", b"{}"); set_times(os.path.join(dm.ROOT, "项目A"), 30)
+dm.organize(settle=3, loose_dirs=True)
+check("project folder not moved by loose-folder organize", os.path.isdir(os.path.join(dm.ROOT, "项目A")))
 check("category folder not moved into itself", os.path.isdir(os.path.join(dm.ROOT, "图片")) and moved == ["相册\\"])
 
 print("FAILURES:", fails); sys.exit(fails)

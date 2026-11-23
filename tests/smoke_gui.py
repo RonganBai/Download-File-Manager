@@ -5,6 +5,7 @@ import importlib.util, os, sys, tempfile
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["LOCALAPPDATA"] = tempfile.mkdtemp(prefix="dmlad_")
 repo = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, repo)   # 让 download_manager 能导入同目录的 converter_link
 spec = importlib.util.spec_from_file_location("dm", os.path.join(repo, "download_manager.py"))
 dm = importlib.util.module_from_spec(spec); spec.loader.exec_module(dm)
 dm.ROOT = tempfile.mkdtemp(prefix="dmsmoke_")
@@ -49,6 +50,45 @@ assert not restarts and dm.load_cfg()["rules"] == cfg["rules"]
 # 恢复默认规则 → 保存时写回空列表（使用内置规则）
 w.reset_rules(); w.save_rules()
 assert restarts and dm.load_cfg()["rules"] == []
+
+# 常用分类模板 + 关键词：添加“移民身份文件”，保存后带关键词、并自动加入受保护分类
+restarts.clear()
+w.add_preset(*dm.PRESETS[0])
+w.add_preset(*dm.PRESETS[0])                       # 重复添加被拒绝
+assert sum(r["name"].text() == "移民身份文件" for r in w.rule_rows) == 1
+w.save_rules()
+cfg = dm.load_cfg()
+assert restarts and any(r[0] == "移民身份文件" and len(r) == 3 and "passport" in r[2] for r in cfg["rules"])
+assert "移民身份文件" in cfg["protect"]
+w.cfg = cfg
+
+# 重新整理已有文件：规则生效后，“图片”里的护照照片挪到“移民身份文件”
+dm.apply_rules(cfg["rules"])
+os.makedirs(os.path.join(dm.ROOT, "图片", "2023-05"), exist_ok=True)
+open(os.path.join(dm.ROOT, "图片", "2023-05", "passport photo.jpg"), "w").close()
+w.reorganize_existing()
+assert any(f == "passport photo.jpg" for _, _, fs in os.walk(os.path.join(dm.ROOT, "移民身份文件")) for f in fs)
+
+# 清理垃圾文件：列表对话框里取消勾选一项，只删其余的
+os.makedirs(os.path.join(dm.ROOT, "散落"))
+for n in ("Thumbs.db", "._a.jpg"):
+    p = os.path.join(dm.ROOT, "散落", n); open(p, "w").write("x")
+gone = []
+dm.recycle = lambda paths: [gone.append(os.path.basename(p)) or os.remove(p) for p in paths]
+orig_init = dm.Dialog.__init__
+def init_and_uncheck(self, *a, **k):
+    orig_init(self, *a, **k)
+    tree = k.get("extra")
+    if tree is not None:                       # 取消勾选 ._a.jpg 所在的组
+        for i in range(tree.topLevelItemCount()):
+            g = tree.topLevelItem(i)
+            if "macOS" in g.text(0):
+                g.setCheckState(0, dm.Qt.CheckState.Unchecked)
+dm.Dialog.__init__ = init_and_uncheck
+w.clean_junk()
+dm.Dialog.__init__ = orig_init
+assert gone == ["Thumbs.db"], gone
+assert os.path.exists(os.path.join(dm.ROOT, "散落", "._a.jpg"))
 
 # 管理的文件夹：拒绝系统目录
 restarts.clear()

@@ -5,7 +5,7 @@ import os, subprocess, sys
 
 here = os.path.dirname(os.path.abspath(__file__))
 repo = os.path.dirname(here)
-tests = ["test_cleanup.py", "test_organize_and_system.py", "test_rules_and_root.py", "smoke_gui.py"]
+tests = ["test_cleanup.py", "test_organize_and_system.py", "test_rules_and_root.py", "test_keywords_junk.py", "test_converter_link.py", "smoke_gui.py"]
 env = dict(os.environ, PYTHONIOENCODING="utf-8")
 failed = []
 for t in tests:

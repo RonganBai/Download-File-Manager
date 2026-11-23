@@ -3,6 +3,7 @@
 import ctypes
 import hashlib
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -21,7 +22,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QLabel, QPushButton,
                              QStackedWidget, QScrollArea, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QTextBrowser,
                              QProgressBar, QSystemTrayIcon, QDialog, QFileDialog, QHeaderView, QSlider)
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 APP = "下载管家"
 CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
 CFG_PATH = os.path.join(CFG_DIR, "config.json")
@@ -29,7 +30,8 @@ ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(_
 DEFAULTS = dict(auto=True, clean_on=False, clean_days=30, cap_on=False, cap_gb=20.0, protect=["重要文件"],
                 autostart=False, close="tray", theme="dark", side_open=True,
                 accent="blue", bg_image="", bg_vis=35, card_alpha=88, win_opacity=100, img_colors=[],
-                sort_key="time", sort_desc=True, settle_sec=10, rules=[], root="", by_month=True)
+                sort_key="time", sort_desc=True, settle_sec=10, rules=[], root="", by_month=True,
+                loose_dirs=False)
 BORDER = 6
 
 DEFAULT_RULES = [
@@ -51,6 +53,8 @@ RULES = list(DEFAULT_RULES)
 CATS = [r[0] for r in RULES] + [OTHER]
 GLYPH = dict(DEFAULT_GLYPH)
 EXT_MAP = {}
+KW_TEXT = {}                          # 分类名 → 关键词原文（设置页显示用）
+KEYWORDS = []                         # [(分类名, 限定扩展名集合, [关键词正则])]，按规则顺序
 BY_MONTH = True                       # 是否按“年-月”分子文件夹
 SORTS = (("修改时间", "time"), ("名称", "name"), ("大小", "size"), ("分类", "cat"), ("类型（扩展名）", "ext"))
 COL_KEYS = ("name", "cat", "size", "time")
@@ -378,13 +382,37 @@ def parse_exts(text):
     return out
 
 
+def parse_keywords(text):
+    """“护照, Passport；I-20、签证” → ["护照", "passport", "i-20", "签证"]。关键词里可以有空格（如 green card）。"""
+    out = []
+    for t in re.split(r"[,，;；、\n]+", text or ""):
+        t = " ".join(t.split()).lower()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def _kw_pattern(kw):
+    """英文 / 数字关键词按“整词”匹配，避免 opt 误中 adopt；中文按包含匹配。
+    文件名里的 _ - . 空格 都视为分隔符，所以 green card 也能匹配 green_card、Green-Card。"""
+    if kw.isascii():
+        body = r"[\s_.\-]*".join(re.escape(p) for p in re.split(r"[\s_.\-]+", kw) if p)
+        # 4 个字母以上的词允许后面直接跟数字（lecture3、invoice2024）；cv、opt 这类短词严格整词，cv2 不算
+        tail = r"(?![a-z])" if len(kw) >= 4 and kw[-1].isalpha() else r"(?![a-z0-9])"
+        return re.compile(r"(?<![a-z0-9])" + body + tail)
+    return re.compile(re.escape(kw))
+
+
 def validate_rules(rows):
-    """rows: [(分类名, 扩展名文本), ...]。返回 (规范化后的 [[名, ".a .b"]], 错误信息)。"""
+    """rows: [(分类名, 扩展名文本[, 关键词文本]), ...]。
+    返回 (规范化后的 [[名, ".a .b"]] 或带关键词的 [[名, ".a", "kw1, kw2"]], 错误信息)。
+    只填关键词不填扩展名 = 任意类型的文件，只要文件名含关键词就归入该分类。"""
     out, seen = [], set()
     for row in rows:
-        if not isinstance(row, (list, tuple)) or len(row) != 2 or not all(isinstance(x, str) for x in row):
+        if not isinstance(row, (list, tuple)) or len(row) not in (2, 3) or not all(isinstance(x, str) for x in row):
             return None, "分类规则格式不正确"
         name, exts = row[0].strip(), row[1]
+        kws = parse_keywords(row[2]) if len(row) == 3 else []
         if not name:
             return None, "分类名不能为空"
         err = bad_filename(name)
@@ -396,9 +424,9 @@ def validate_rules(rows):
             return None, f"分类“{name}”重复了"
         seen.add(name.lower())
         e = parse_exts(exts)
-        if not e:
-            return None, f"分类“{name}”至少需要一个扩展名"
-        out.append([name, " ".join(e)])
+        if not e and not kws:
+            return None, f"分类“{name}”需要填写扩展名或关键词（至少一种）"
+        out.append([name, " ".join(e), ", ".join(kws)] if kws else [name, " ".join(e)])
     if not out:
         return None, "至少保留一个分类"
     return out, ""
@@ -407,10 +435,16 @@ def validate_rules(rows):
 def apply_rules(rules):
     """让配置里的分类规则生效；rules 为空或不合法时使用内置规则。返回错误信息（合法时为空）。"""
     norm, err = validate_rules(rules) if rules else (None, "")
+    KEYWORDS.clear()
+    KW_TEXT.clear()
     if norm is None:
         new = list(DEFAULT_RULES)
     else:
-        new = [(n, DEFAULT_GLYPH.get(n, FOLDER_GLYPH), e) for n, e in norm]
+        new = [(r[0], DEFAULT_GLYPH.get(r[0], FOLDER_GLYPH), r[1]) for r in norm]
+        for r in norm:
+            if len(r) == 3:
+                KW_TEXT[r[0]] = r[2]
+                KEYWORDS.append((r[0], set(r[1].split()), [_kw_pattern(k) for k in parse_keywords(r[2])]))
     RULES[:] = new
     CATS[:] = [r[0] for r in RULES] + [OTHER]
     GLYPH.clear()
@@ -418,9 +452,38 @@ def apply_rules(rules):
     GLYPH.update({k: DEFAULT_GLYPH[k] for k in RESERVED_CATS})
     EXT_MAP.clear()
     for name, _, exts in reversed(RULES):     # 同一扩展名出现在多个分类时，排在前面的优先
+        if any(k[0] == name for k in KEYWORDS):
+            continue                          # 关键词分类的扩展名只是“附加条件”，不单独按扩展名匹配
         for e in exts.split():
             EXT_MAP[e] = name
     return err
+
+
+# 常用的“按主题”分类模板（关键词分类：文件名含关键词即归入，不论类型；可在设置里修改）
+PRESETS = [
+    ("移民身份文件", "", "护照, passport, 签证, visa, 绿卡, green card, 移民, 身份, 居留, residence permit, "
+                       "i-20, i20, i-94, i94, i-797, i797, i-765, i-485, i-130, i-140, ds-160, ds160, ds-2019, "
+                       "sevis, ead, uscis, h-1b, h1b, f-1, opt, cpt, 出生证明, birth certificate, 户口, 身份证"),
+    ("工作文件", "", "offer, 录用, 简历, resume, cv, 合同, contract, 劳动合同, nda, 入职, onboarding, 离职, "
+                    "工资, 薪资, payslip, paystub, 工作证明, employment, 周报, 月报, 会议纪要, 述职"),
+    ("财务票据", "", "发票, invoice, 收据, receipt, 账单, 对账单, 报销, 税, tax, w-2, w2, 1099, "
+                    "1040, 银行, bank, 保险, insurance, 房租, lease, 租房"),
+    ("学习资料", "", "课程, course, 讲义, lecture, 作业, homework, assignment, 论文, thesis, 成绩单, "
+                    "transcript, syllabus, 考试, exam, 笔记, 学位, diploma"),
+]
+
+
+def category_for(filename):
+    """文件应归入的分类：先看关键词分类（按规则顺序），再按扩展名。"""
+    base, ext = os.path.splitext(filename)
+    ext = ext.lower()
+    low = base.lower()
+    for name, exts, pats in KEYWORDS:
+        if exts and ext not in exts:
+            continue
+        if any(p.search(low) for p in pats):
+            return name
+    return EXT_MAP.get(ext, OTHER)
 
 
 def _norm(p):
@@ -755,10 +818,11 @@ def is_partial(name, names):
     return any(low + s in names for s in COMPANION_EXT)
 
 
-def organize(settle=None):
+def organize(settle=None, loose_dirs=False):
     """整理下载根目录里的新文件。返回 (已移动的文件名, 多少秒后需要重试 或 None)。
     仍在下载的文件不需要定时重试：下载完成改名时文件夹监视会再次触发整理；
-    只有“刚到达、还没稳定”或“被占用”的文件才安排重试。"""
+    只有“刚到达、还没稳定”或“被占用”的文件才安排重试。
+    loose_dirs=True 时，根目录里散落的文件夹（解压出来的、软件导出的）也会按其主要内容整个归入分类。"""
     settle = DEFAULTS["settle_sec"] if settle is None else settle
     moved, retry = [], None
 
@@ -771,8 +835,16 @@ def organize(settle=None):
         return moved, retry
     names = {e.name.lower() for e in entries}
     now = time.time()
+    cat_names = {c.lower() for c in CATS}
     for e in entries:
         try:
+            if loose_dirs and e.is_dir(follow_symlinks=False) and e.name.lower() not in cat_names:
+                r = organize_dir(e, now, settle)
+                if r is True:
+                    moved.append(e.name + "\\")
+                elif r:
+                    later(r)
+                continue
             if not e.is_file(follow_symlinks=False):
                 continue
             st = e.stat(follow_symlinks=False)   # Windows 上 scandir 已带回属性，不会再次访问磁盘
@@ -785,7 +857,7 @@ def organize(settle=None):
                 later(settle - age + 0.5)
                 continue
             ext = os.path.splitext(e.name)[1].lower()
-            cat = category_of(ext)
+            cat = category_for(e.name)
             d = cat_dir(cat, st.st_mtime)
             os.makedirs(d, exist_ok=True)
             os.rename(e.path, free_path(d, e.name))   # 文件仍被占用（下载中）时会失败，稍后重试
@@ -794,6 +866,250 @@ def organize(settle=None):
         except OSError:
             later(3)
     return moved, retry
+
+
+DIR_SCAN_LIMIT = 5000      # 判断文件夹内容时最多看这么多个文件，避免超大文件夹拖慢整理
+
+
+def dir_profile(path):
+    """统计文件夹里的内容：返回 (各分类的字节数, 最新修改时间, 是否含未完成下载, 文件数)。不跟随链接 / 联接。"""
+    sizes, newest, partial, n = {}, 0.0, False, 0
+    stack = [path]
+    while stack and n < DIR_SCAN_LIMIT:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        names = {x.name.lower() for x in entries}
+        for x in entries:
+            try:
+                st = x.stat(follow_symlinks=False)
+                if is_reparse(st):
+                    continue
+                newest = max(newest, st.st_mtime)
+                if x.is_dir(follow_symlinks=False):
+                    stack.append(x.path)
+                    continue
+                n += 1
+                if is_partial(x.name, names):
+                    partial = True
+                if junk_reason(x.name, st, time.time()) is None:
+                    c = category_for(x.name)
+                    sizes[c] = sizes.get(c, 0) + max(st.st_size, 1)
+            except OSError:
+                pass
+    return sizes, newest, partial, n
+
+
+def organize_dir(entry, now, settle):
+    """把根目录里一个散落的文件夹整个归入分类（按其中占用空间最多的文件类型）。
+    返回 True=已移动，数字=多少秒后重试，None=跳过。"""
+    st = entry.stat(follow_symlinks=False)
+    if st.st_file_attributes & 2 or is_reparse(st) or entry.name.startswith((".", "$", "~")):
+        return None
+    sizes, newest, partial, n = dir_profile(entry.path)
+    if partial:
+        return None                            # 里面还有没下载完的文件：等它下载完，监视会再次触发
+    wait = max(settle, 60)                     # 文件夹（如正在解压）多给一点时间
+    if now - max(newest, arrived_time(st)) < wait:
+        return wait - (now - max(newest, arrived_time(st))) + 1
+    if not sizes:
+        return None                            # 空文件夹或只有垃圾文件：交给“清理垃圾文件”
+    cat = max(sizes, key=sizes.get)
+    d = cat_dir(cat, newest or st.st_mtime)
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.rename(entry.path, free_path(d, entry.name))
+    except OSError:
+        return 60                              # 文件夹正被某个程序使用：一分钟后再试
+    log(f"整理文件夹：{entry.name}\\（{n} 个文件）→ {cat}")
+    return True
+
+
+def plan_reorganize(protect=()):
+    """按当前规则找出“放错分类”的已整理文件。返回 [(路径, 现分类, 新分类)]。
+    只看分类文件夹里直接存放（或在“年-月”子文件夹里）的文件；整个归档进来的文件夹保持完整，不拆散。
+    从受保护分类挪到不受保护分类的文件跳过，避免整理之后反而被自动清理。"""
+    out = []
+    protect = set(protect)
+    for x in scan()[0]:
+        if x["cat"] not in CATS:
+            continue
+        rel = os.path.relpath(x["path"], os.path.join(ROOT, x["cat"])).split(os.sep)
+        if len(rel) > 2 or (len(rel) == 2 and not re.fullmatch(r"\d{4}-\d{2}", rel[0])):
+            continue
+        new = category_for(x["name"])
+        if new != x["cat"] and not (x["cat"] in protect and new not in protect):
+            out.append((x["path"], x["cat"], new))
+    return out
+
+
+# ---------------- 垃圾文件 ----------------
+JUNK_NAMES = {"thumbs.db", "ehthumbs.db", "ehthumbs_vista.db", ".ds_store", ".localized"}
+PARTIAL_JUNK_EXT = SKIP_EXT - {".tmp", ".temp", ".~tmp"}
+DAY = 86400
+
+
+def junk_reason(name, st, now):
+    """判断单个文件是否是垃圾文件，返回原因；不是时返回 None。只认非常确定的类型。"""
+    low = name.lower()
+    ext = os.path.splitext(low)[1]
+    age = now - st.st_mtime
+    if low in JUNK_NAMES:
+        return "系统缩略图 / 索引缓存（Thumbs.db 等）"
+    if low.startswith("._") and st.st_size <= 4096:
+        return "macOS 附带文件（._ 开头）"
+    if low.startswith("~$") and st.st_size <= 4096 and age > DAY:
+        return "Office 残留的临时锁文件（~$ 开头）"
+    if ext in (".tmp", ".temp", ".~tmp") and age > DAY:
+        return "过期的临时文件（.tmp）"
+    if (ext in PARTIAL_JUNK_EXT or low.endswith(SKIP_SUFFIX)) and age > 7 * DAY:
+        return "没下载完、7 天以上没有进展的残留"
+    if st.st_size == 0 and age > DAY and low not in SKIP_NAMES:
+        return "空文件（0 字节）"
+    return None
+
+
+_COPY_RE = re.compile(r"^(.*?)(?:\s?\(\d{1,3}\)|\s-\s(?:副本|copy)(?:\s\(\d{1,3}\))?|\s(?:copy|副本))$", re.I)
+
+
+def _same_content(a, b, size):
+    if size > 2 * 1024 ** 3:
+        return False                           # 超大文件不做比对，不算重复
+    h = []
+    for p in (a, b):
+        m = hashlib.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                m.update(chunk)
+        h.append(m.digest())
+    return h[0] == h[1]
+
+
+def find_junk(protect=()):
+    """扫描整个管理文件夹（含散落的子文件夹）里的垃圾文件。
+    返回 [dict(path, size, reason)]；不删除任何东西，交给用户确认。
+    重复副本只认“同一文件夹里、文件名带 (1) / 副本 / copy、内容与原文件完全相同”的那一份。"""
+    now = time.time()
+    out = []
+    protect_dirs = [_norm(os.path.join(ROOT, c)) + os.sep for c in protect]
+
+    def protected(p):
+        n = _norm(p) + os.sep
+        return any(n.startswith(d) for d in protect_dirs)
+
+    def walk(d, depth):
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            return True
+        files = {}
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+                if not is_reparse(st) and e.is_file(follow_symlinks=False):
+                    files[e.name.lower()] = (e, st)
+            except OSError:
+                pass
+        empty = True
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+                if is_reparse(st):
+                    empty = False
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    if e.name.lower() == "__macosx":
+                        empty = False
+                        out.append(dict(path=e.path, size=dir_size(e.path), reason="macOS 压缩包残留（__MACOSX 文件夹）"))
+                        continue
+                    sub_empty = walk(e.path, depth + 1)
+                    is_cat_top = depth == 0 and e.name.lower() in {c.lower() for c in CATS}
+                    if sub_empty and not is_cat_top and now - st.st_mtime > DAY and not protected(e.path):
+                        empty_dirs.append(e.path)
+                    else:
+                        empty = False
+                    continue
+                empty = False
+                r = junk_reason(e.name, st, now)
+                if r and r.startswith("空文件") and protected(e.path):
+                    r = None
+                if r is None and not protected(e.path) and st.st_size > 0:
+                    base, ext = os.path.splitext(e.name)
+                    m = _COPY_RE.match(base)
+                    orig = files.get((m.group(1) + ext).lower()) if m and m.group(1) else None
+                    if orig and orig[0].path != e.path and orig[1].st_size == st.st_size:
+                        try:
+                            if _same_content(orig[0].path, e.path, st.st_size):
+                                r = f"重复下载的副本（与“{orig[0].name}”内容完全相同）"
+                        except OSError:
+                            pass
+                if r:
+                    out.append(dict(path=e.path, size=st.st_size, reason=r))
+            except OSError:
+                empty = False
+        return empty
+
+    empty_dirs = []
+    walk(ROOT, 0)
+    # 嵌套的空文件夹只列最外层那个（删掉它就连里面的一起删了）
+    tops = set(map(_norm, empty_dirs))
+    for p in empty_dirs:
+        parent = _norm(os.path.dirname(p))
+        if parent not in tops:
+            out.append(dict(path=p, size=0, reason="空文件夹"))
+    return out
+
+
+def dir_size(path):
+    total, stack = 0, [path]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    st = e.stat(follow_symlinks=False)
+                    if is_reparse(st):
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    else:
+                        total += st.st_size
+        except OSError:
+            pass
+    return total
+
+
+def inside_root(path):
+    """真实路径位于管理文件夹之内（且本身不是链接 / 联接）。"""
+    try:
+        if is_reparse(os.lstat(path)):
+            return False
+        return (_norm(path) + os.sep).startswith(_norm(ROOT) + os.sep) and _norm(path) != _norm(ROOT)
+    except OSError:
+        return False
+
+
+def delete_junk(items):
+    """把确认过的垃圾文件移入回收站。放不进回收站的跳过。返回 (删除数, 释放字节, 跳过数)。"""
+    n, freed, skipped = 0, 0, 0
+    for x in items:
+        p = x["path"]
+        if not inside_root(p) or not can_recycle(p, x["size"]):
+            skipped += 1
+            continue
+        try:
+            recycle([p])
+            n += 1
+            freed += x["size"]
+            log(f"清理垃圾：{os.path.relpath(p, ROOT)}（{x['reason']}）")
+        except OSError:
+            skipped += 1
+    remove_empty_dirs()
+    return n, freed, skipped
 
 
 def scan():
@@ -1377,6 +1693,7 @@ class Main(QWidget):
         sl.addStretch()
         item("", "立即整理", lambda: self.do_organize(True))
         item("", "立即清理", self.do_cleanup)
+        item("\ue74d", "清理垃圾文件", self.clean_junk)
         item("", "打开管理的文件夹" if self.cfg.get("root") else "打开下载文件夹", lambda: os.startfile(ROOT))
         self.btn_appear = item("", "外观", self.open_appearance, True)
         self.btn_settings = item("", "设置", self.open_settings, True)
@@ -1634,27 +1951,48 @@ class Main(QWidget):
         self.s_month = Switch()
         self.s_month.setChecked(bool(self.cfg["by_month"]))
         self.s_month.toggled.connect(self.set_by_month)
+        self.s_loose = Switch()
+        self.s_loose.setChecked(bool(self.cfg["loose_dirs"]))
+        self.s_loose.toggled.connect(lambda on: self.set_cfg("loose_dirs", bool(on)))
+        row(c, "整理散落的文件夹", self.s_loose,
+            sub="把直接放在这里的子文件夹（解压出来的、软件导出的）按其中主要的文件类型整个归入分类；里面的文件保持原样不拆散")
         row(c, "按“年-月”分子文件夹", self.s_month, sub="关闭后直接放在分类文件夹里；已经整理好的文件保持不变")
 
-        c = card("分类规则", "按扩展名把文件放进对应分类，扩展名用空格或逗号分隔；没有匹配的文件放进“其他文件”。"
-                         "改名会同时重命名对应的文件夹；删除分类不会删除文件夹和里面的文件。保存后自动重启生效。")
+        c = card("分类规则",
+                 "每个分类可以按扩展名匹配，也可以按文件名里的关键词匹配（如“护照, passport, I-20”）。"
+                 "填了关键词的分类优先：文件名含任一关键词就归入它，扩展名一栏留空表示不限类型。"
+                 "英文关键词按整词匹配（opt 不会误中 adopt）。没有匹配的文件放进“其他文件”。"
+                 "改名会同时重命名对应文件夹；删除分类不会删除文件夹和里面的文件。保存后自动重启生效。")
         self.rules_box = QVBoxLayout()
         self.rules_box.setSpacing(6)
         c.addLayout(self.rules_box)
         self.rule_rows = []
         for name, _, exts in RULES:
-            self.add_rule_row(name, exts, name)
+            self.add_rule_row(name, exts, name, KW_TEXT.get(name, ""))
         hb = QHBoxLayout()
         b_add = QPushButton("添加分类")
         b_add.clicked.connect(lambda: self.add_rule_row("", "", None))
+        b_preset = QPushButton("添加常用分类 ▾")
+        pm = QMenu(b_preset)
+        for pname, pexts, pkws in PRESETS:
+            pm.addAction(pname, lambda p=(pname, pexts, pkws): self.add_preset(*p))
+        b_preset.setMenu(pm)
         b_def = QPushButton("恢复默认规则")
         b_def.clicked.connect(self.reset_rules)
         b_save = QPushButton("保存并重启", objectName="primary")
         b_save.clicked.connect(self.save_rules)
-        for b in (b_add, b_def):
+        for b in (b_add, b_preset, b_def):
             hb.addWidget(b)
         hb.addStretch()
         hb.addWidget(b_save)
+        c.addLayout(hb)
+        hb = QHBoxLayout()
+        lbl = QLabel("规则改了以后，已经整理好的文件不会自动挪动：", objectName="hint")
+        b_re = QPushButton("按当前规则重新整理已有文件")
+        b_re.clicked.connect(self.reorganize_existing)
+        hb.addWidget(lbl)
+        hb.addStretch()
+        hb.addWidget(b_re)
         c.addLayout(hb)
 
         c = card("自动清理", "清理的文件进入回收站，可以还原；后台每 30 分钟检查一次。")
@@ -1707,6 +2045,13 @@ class Main(QWidget):
         b_rdef.clicked.connect(lambda: self.choose_root(True))
         row(c, "管理的文件夹", b_root, b_rdef,
             sub=ROOT + ("" if self.cfg["root"] else "（系统“下载”文件夹）"))
+
+        import converter_link   # 相关应用：只是推荐，两个软件各自独立下载、独立运行
+        c = card("相关应用")
+        installed, text = converter_link.status()
+        b_conv = QPushButton("访问下载页" if installed else "下载格式转换器")
+        b_conv.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(converter_link.DOWNLOAD_URL)))
+        row(c, "格式转换器", b_conv, sub=text)
 
         c = card("最近记录")
         self.log_view = QTextBrowser()
@@ -1761,19 +2106,24 @@ class Main(QWidget):
         BY_MONTH = bool(on)
         self.set_cfg("by_month", bool(on))
 
-    def add_rule_row(self, name, exts, orig):
+    def add_rule_row(self, name, exts, orig, kws="", protect=False):
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
         n = QLineEdit(name, placeholderText="分类名")
-        n.setFixedWidth(130)
-        e = QLineEdit(" ".join(x.lstrip(".") for x in exts.split()), placeholderText="扩展名，例如 pdf docx txt")
+        n.setFixedWidth(120)
+        e = QLineEdit(" ".join(x.lstrip(".") for x in exts.split()), placeholderText="扩展名，如 pdf docx")
+        k = QLineEdit(kws, placeholderText="文件名关键词（可选），逗号分隔")
+        k.setToolTip(kws)
+        e.setCursorPosition(0)                 # 内容较长时显示开头而不是结尾
+        k.setCursorPosition(0)
         rm = QPushButton("删除")
         rm.setCursor(Qt.CursorShape.PointingHandCursor)
         h.addWidget(n)
-        h.addWidget(e, 1)
+        h.addWidget(e, 2)
+        h.addWidget(k, 3)
         h.addWidget(rm)
-        rec = dict(w=w, name=n, exts=e, orig=orig)
+        rec = dict(w=w, name=n, exts=e, kws=k, orig=orig, protect=protect)
 
         def remove():
             if rec in self.rule_rows:
@@ -1792,13 +2142,21 @@ class Main(QWidget):
         for name, _, exts in DEFAULT_RULES:
             self.add_rule_row(name, exts, name if name in CATS else None)
 
+    def add_preset(self, name, exts, kws):
+        if any(r["name"].text().strip() == name for r in self.rule_rows):
+            self.show_toast(f"已经有“{name}”分类了")
+            return
+        # 身份、工作、财务类文件很重要：默认加入“受保护的分类”，自动清理不会动它们
+        self.add_rule_row(name, exts, None, kws, protect=True)
+        self.show_toast(f"已添加“{name}”，可修改关键词后点“保存并重启”")
+
     def save_rules(self):
-        rows = [(r["name"].text(), r["exts"].text()) for r in self.rule_rows]
+        rows = [(r["name"].text(), r["exts"].text(), r["kws"].text()) for r in self.rule_rows]
         norm, err = validate_rules(rows)
         if err:
             self.show_toast(err)
             return
-        names = [n for n, _ in norm]
+        names = [r[0] for r in norm]
         renames = [(r["orig"], n) for r, n in zip(self.rule_rows, names) if r["orig"] and r["orig"] != n]
         renamed_from = {o for o, _ in renames}
         removed = [c for c in CATS if c != OTHER and c not in names and c not in renamed_from]
@@ -1822,6 +2180,9 @@ class Main(QWidget):
                 log(f"分类文件夹改名失败：{o} → {n}（{e.strerror or e}）")
         mp = dict(renames)
         self.cfg["protect"] = [mp.get(p, p) for p in self.cfg["protect"] if mp.get(p, p) in names + [OTHER]]
+        for r, n in zip(self.rule_rows, names):
+            if r["protect"] and n not in self.cfg["protect"]:
+                self.cfg["protect"].append(n)
         self.cfg["rules"] = [] if norm == [[n, e] for n, _, e in DEFAULT_RULES] else norm
         save_cfg(self.cfg)
         self.restart()
@@ -2166,7 +2527,7 @@ class Main(QWidget):
     def on_fs_settled(self):
         """文件夹变化稳定后：整理新文件；窗口可见才刷新列表，隐藏时只记下“需要刷新”。"""
         if self.cfg["auto"]:
-            moved, retry = organize(self.cfg["settle_sec"])
+            moved, retry = organize(self.cfg["settle_sec"], self.cfg["loose_dirs"])
             if moved and not self.isVisible():
                 self.tray.showMessage(APP, "已整理：" + moved[0] if len(moved) == 1 else f"已整理 {len(moved)} 个新文件",
                                       self.app_icon, 3000)
@@ -2191,7 +2552,7 @@ class Main(QWidget):
 
     def tick(self, organize_first=True):
         if organize_first and self.cfg["auto"]:
-            _, retry = organize(self.cfg["settle_sec"])
+            _, retry = organize(self.cfg["settle_sec"], self.cfg["loose_dirs"])
             self.schedule_retry(retry)
         items, dirs = scan()
         self.dirty = False
@@ -2490,15 +2851,14 @@ class Main(QWidget):
                     return
                 os.rename(s[0], dst)
                 log(f"重命名：{old} → {new}")
-                # 扩展名变了：分类也可能变了，放到新分类里
+                # 新名字按规则属于另一个分类（改了扩展名，或加上 / 去掉了关键词）：放到新分类里
                 parts = os.path.relpath(s[0], ROOT).split(os.sep)
-                new_cat = category_of(os.path.splitext(new)[1].lower())
-                if len(parts) > 1 and parts[0] in CATS and parts[0] != new_cat and \
-                        os.path.splitext(new)[1].lower() != os.path.splitext(old)[1].lower():
+                new_cat = category_for(new)
+                if len(parts) > 1 and parts[0] in CATS and parts[0] != new_cat and new_cat != category_for(old):
                     try:
                         move_to(dst, new_cat)
                         remove_empty_dirs()
-                        self.show_toast(f"扩展名已改变，已移到“{new_cat}”")
+                        self.show_toast(f"按分类规则已移到“{new_cat}”")
                     except OSError:
                         self.show_toast("已重命名，但移到新分类失败")
             except OSError as e:
@@ -2545,6 +2905,8 @@ class Main(QWidget):
         mv = self.move_menu()
         mv.setTitle("移动到")
         m.addMenu(mv)
+        import converter_link   # 可选联动：装了「格式转换器」才会多出「转换为 ▸」
+        converter_link.add_menu(m, self.selected(), self.show_toast)
         m.addAction("复制路径", lambda: QApplication.clipboard().setText("\n".join(self.selected())))
         m.addSeparator()
         m.addAction("删除\tDel", self.delete_selected)
@@ -2552,11 +2914,92 @@ class Main(QWidget):
 
     def do_organize(self, manual=False):
         # 手动“立即整理”：用户明确要求，只保留 3 秒的最短等待
-        moved, retry = organize(3 if manual else self.cfg["settle_sec"])
+        moved, retry = organize(3 if manual else self.cfg["settle_sec"], self.cfg["loose_dirs"])
         self.schedule_retry(retry)
         self.tick()
         if manual:
             self.show_toast(f"整理了 {len(moved)} 个文件" if moved else "没有需要整理的文件")
+
+    def reorganize_existing(self):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            plan = plan_reorganize(self.cfg["protect"])
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not plan:
+            self.show_toast("已整理的文件都符合当前规则，不需要挪动")
+            return
+        by = {}
+        for _, a, b in plan:
+            by[(a, b)] = by.get((a, b), 0) + 1
+        lines = "\n".join(f"  {a} → {b}：{n} 个" for (a, b), n in sorted(by.items(), key=lambda t: -t[1])[:12])
+        sample = "\n".join("  " + os.path.basename(p) for p, _, _ in plan[:6])
+        msg = (f"按当前分类规则，有 {len(plan)} 个已整理的文件应换到别的分类：\n{lines}\n\n例如：\n{sample}"
+               + ("\n  …" if len(plan) > 6 else "")
+               + "\n\n只是在分类之间移动，不会删除任何文件。你手动移动过的文件也可能被移回规则对应的分类。")
+        if not Dialog(self, "重新整理已有文件", msg, ok=f"移动 {len(plan)} 个文件").exec():
+            return
+        bad = 0
+        for p, _, new in plan:
+            try:
+                move_to(p, new)
+            except OSError:
+                bad += 1
+        remove_empty_dirs()
+        self.tick()
+        self.show_toast(f"已重新整理 {len(plan) - bad} 个文件" + (f"，{bad} 个失败（可能正在使用）" if bad else ""))
+
+    def clean_junk(self):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            junk = find_junk(self.cfg["protect"])
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not junk:
+            self.show_toast("没有发现垃圾文件")
+            return
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["文件", "大小"])
+        tree.setMinimumSize(620, 320)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        groups = {}
+        for x in junk:
+            g = groups.get(x["reason"].split("（与“")[0])
+            if g is None:
+                g = QTreeWidgetItem(tree, [x["reason"].split("（与“")[0], ""])
+                g.setFlags(g.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsAutoTristate)
+                g.setCheckState(0, Qt.CheckState.Checked)
+                g.total = 0
+                groups[x["reason"].split("（与“")[0]] = g
+            it = QTreeWidgetItem(g, [os.path.relpath(x["path"], ROOT), human(x["size"])])
+            it.setToolTip(0, x["reason"] + "\n" + x["path"])
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(0, Qt.CheckState.Checked)
+            it.junk = x
+            g.total += x["size"]
+        for name, g in groups.items():
+            g.setText(0, f"{name}（{g.childCount()} 项）")
+            g.setText(1, human(g.total))
+        total = sum(x["size"] for x in junk)
+        d = Dialog(self, "清理垃圾文件",
+                   f"在 {ROOT} 及其子文件夹里找到 {len(junk)} 项可以清理的内容，共 {human(total)}。"
+                   "取消勾选可以保留；确认后移入回收站，可以还原。", ok="移到回收站", danger=True, extra=tree)
+        if not d.exec():
+            return
+        chosen = []
+        for i in range(tree.topLevelItemCount()):
+            g = tree.topLevelItem(i)
+            for j in range(g.childCount()):
+                c = g.child(j)
+                if c.checkState(0) == Qt.CheckState.Checked:
+                    chosen.append(c.junk)
+        if not chosen:
+            return
+        n, freed, skipped = delete_junk(chosen)
+        self.tick()
+        self.show_toast(f"清理了 {n} 项垃圾，释放 {human(freed)}"
+                        + (f"；{skipped} 项无法放入回收站，已跳过" if skipped else ""))
 
     def do_cleanup(self):
         if not self.cfg["clean_on"] and not self.cfg["cap_on"]:

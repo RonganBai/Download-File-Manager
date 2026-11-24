@@ -3,6 +3,7 @@
 import importlib.util, os, sys, tempfile, time
 
 repo = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, repo)   # download_manager 会导入同目录的 archive
 spec = importlib.util.spec_from_file_location("dm", os.path.join(repo, "download_manager.py"))
 dm = importlib.util.module_from_spec(spec); spec.loader.exec_module(dm)
 
@@ -70,5 +71,11 @@ check("month dirs when enabled", os.path.isfile(os.path.join(root, "Docs", time.
 dm.init_settings(dict(dm.DEFAULTS))
 if saved_lad is not None:
     os.environ["LOCALAPPDATA"] = saved_lad
+
+# --- 文字对比度：深色 / 浅色主题里正文、次要文字、提示文字在各层底色上都清楚（≥ 4.5:1） ---
+for theme, t in dm.BASE_THEMES.items():
+    worst = min(dm.contrast(t[fg], t[bg]) for fg in ("text", "muted", "faint")
+                for bg in ("card", "nav", "list", "area", "btn", "frame"))
+    check(f"{theme} text contrast >= 4.5 (worst {worst:.1f})", worst >= 4.5)
 
 print("FAILURES:", fails); sys.exit(fails)

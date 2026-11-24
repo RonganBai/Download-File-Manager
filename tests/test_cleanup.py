@@ -2,6 +2,7 @@ import ctypes, importlib.util, json, os, subprocess, sys, tempfile, time
 from ctypes import wintypes
 
 repo = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, repo)   # download_manager 会导入同目录的 archive
 spec = importlib.util.spec_from_file_location("dm", os.path.join(repo, "download_manager.py"))
 dm = importlib.util.module_from_spec(spec); spec.loader.exec_module(dm)
 
@@ -43,8 +44,8 @@ cfg = dict(base, cap_on=True, cap_gb=0.5)
 mk("重要文件/2024-01/big.pdf", 1)          # 用 monkeypatch 大小，避免写 GB 级文件
 mk("图片/2024-01/a.png", 1, 10); mk("图片/2024-01/b.png", 1, 5)
 real_scan = dm.scan
-def fake_scan():
-    items, dirs = real_scan()
+def fake_scan(*a, **k):
+    items, dirs = real_scan(*a, **k)
     for x in items:
         if x["name"] == "big.pdf": x["size"] = int(0.8 * GB)
     return items, dirs
@@ -57,8 +58,8 @@ dm.scan = real_scan
 fresh()
 for i, age in enumerate((30, 20, 10)):
     mk(f"视频/2024-01/v{i}.mp4", 1, age)
-def fake_scan2():
-    items, dirs = real_scan()
+def fake_scan2(*a, **k):
+    items, dirs = real_scan(*a, **k)
     for x in items: x["size"] = int(0.3 * GB)
     return items, dirs
 dm.scan = fake_scan2
@@ -105,5 +106,16 @@ c = dm.load_cfg()
 check("corrupt cfg backed up", c == dm.DEFAULTS and any(n.startswith("config.json.bad-") for n in os.listdir(d)))
 dm.save_cfg(dict(c, clean_days=7))
 check("atomic save roundtrip", dm.load_cfg()["clean_days"] == 7 and not os.path.exists(dm.CFG_PATH + ".tmp"))
+
+# 解压“覆盖”的旧文件：没有回收站时不删除，交回去改为自动重命名
+_lim, _rec = dm.recycle_limit, dm.recycle
+dm.recycle_limit = lambda p: 0
+called = []
+dm.recycle = lambda ps: called.extend(ps)
+old_f = os.path.join(d, "old.txt"); open(old_f, "w").write("old")
+check("recycle_old refuses without recycle bin", dm.recycle_old(old_f) is False and os.path.isfile(old_f) and not called)
+dm.recycle_limit = lambda p: 10 ** 12
+check("recycle_old recycles when possible", dm.recycle_old(old_f) is True and called == [old_f])
+dm.recycle_limit, dm.recycle = _lim, _rec
 
 print("FAILURES:", fails); sys.exit(fails)

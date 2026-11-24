@@ -1,6 +1,7 @@
 import importlib.util, os, sys, tempfile, time
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 repo = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, repo)   # download_manager 会导入同目录的 archive
 spec = importlib.util.spec_from_file_location("dm", os.path.join(repo, "download_manager.py"))
 dm = importlib.util.module_from_spec(spec); spec.loader.exec_module(dm)
 from PyQt6.QtCore import QCoreApplication, Qt

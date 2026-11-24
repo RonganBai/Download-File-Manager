@@ -1,6 +1,8 @@
-﻿; 下载管家 安装包脚本（Inno Setup 6）——由 build.ps1 调用
-#define AppName "下载管家"
-#define AppVersion "2.4.1"
+﻿; 自动整理文件管理器（原名“下载管家”）安装包脚本（Inno Setup 6）——由 build.ps1 调用
+#define AppName "自动整理文件管理器"
+; 旧名称：开机启动项的名字沿用它（程序内也用它读写），旧版的快捷方式在升级时删除
+#define OldName "下载管家"
+#define AppVersion "2.9.2"
 #define AppPublisher "RonganBai"
 #define AppExe "DownloadButler.exe"
 #ifndef DistDir
@@ -18,6 +20,8 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 DefaultDirName={autopf}\DownloadButler
 DefaultGroupName={#AppName}
+; 改名后开始菜单文件夹也用新名称（旧的“下载管家”文件夹在 [InstallDelete] 中删除）
+UsePreviousGroup=no
 DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -33,6 +37,7 @@ WizardStyle=modern
 CloseApplications=no
 VersionInfoVersion={#AppVersion}
 VersionInfoProductName=Download Butler
+VersionInfoDescription={#AppName}
 
 [Languages]
 Name: "default"; MessagesFile: "compiler:Default.isl"
@@ -41,7 +46,7 @@ Name: "default"; MessagesFile: "compiler:Default.isl"
 default.TaskDesktop=创建桌面快捷方式 / Create a desktop shortcut
 default.TaskAutostart=开机自动在后台运行（自动整理下载文件夹）/ Start with Windows
 default.GroupExtra=附加选项 / Additional options:
-default.LaunchApp=立即运行 下载管家 / Launch Download Butler
+default.LaunchApp=立即运行 {#AppName} / Launch Download Butler
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:TaskDesktop}"; GroupDescription: "{cm:GroupExtra}"
@@ -53,6 +58,10 @@ Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs cr
 [InstallDelete]
 ; 覆盖安装时清掉旧版本残留的运行库
 Type: filesandordirs; Name: "{app}\_internal"
+; 改名前（下载管家）创建的快捷方式
+Type: filesandordirs; Name: "{autoprograms}\{#OldName}"
+Type: files; Name: "{autodesktop}\{#OldName}.lnk"
+Type: files; Name: "{userdesktop}\{#OldName}.lnk"
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\_internal\assets\icon.ico"
@@ -60,7 +69,7 @@ Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\_internal\assets\icon.ico"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; \
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#OldName}"; \
     ValueData: """{app}\{#AppExe}"" --min"; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
@@ -76,7 +85,7 @@ Type: filesandordirs; Name: "{localappdata}\DownloadButler\thumbs"
 var
   WasRunning: Boolean;
 
-{ 结束正在运行的下载管家（它持有 DownloadButlerMutex），返回之前是否在运行 }
+{ 结束正在运行的程序（它持有 DownloadButlerMutex），返回之前是否在运行 }
 function StopApp(): Boolean;
 var
   Code, I: Integer;
@@ -118,5 +127,5 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   { 程序内开启的开机启动也一并移除 }
   if CurUninstallStep = usUninstall then
-    RegDeleteValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#AppName}');
+    RegDeleteValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#OldName}');
 end;

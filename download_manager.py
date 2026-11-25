@@ -17,6 +17,7 @@ from ctypes import wintypes
 import archive
 import help_content
 import journal
+import updater
 from datetime import datetime, timedelta
 
 from PyQt6.QtCore import QVariantAnimation, QEasingCurve, QFileSystemWatcher, QProcess, QThread, pyqtSignal, Qt, QTimer, QSize, QRectF, QPropertyAnimation, pyqtProperty, QFileInfo, QUrl, QMimeData, QPoint
@@ -24,10 +25,10 @@ from PyQt6.QtGui import QCursor, QIcon, QPixmap, QPainter, QColor, QFont, QPen, 
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (QApplication, QSizePolicy, QWidget, QFrame, QLabel, QPushButton, QLineEdit, QHBoxLayout, QVBoxLayout,
                              QGridLayout, QTreeWidget, QTreeWidgetItem, QAbstractItemView, QFileIconProvider, QMenu,
-                             QStackedWidget, QScrollArea, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QTextBrowser,
+                             QStackedWidget, QScrollArea, QCheckBox, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextBrowser,
                              QProgressBar, QSystemTrayIcon, QDialog, QFileDialog, QHeaderView, QSlider)
 
-VERSION = "2.9.2"
+VERSION = "2.10.0"
 APP = "下载管家"          # 内部标识：配置目录、开机启动项、密码本加密用它，改名后保持不变以免丢失设置
 APP_NAME = "自动整理文件管理器"     # 显示给用户的名称
 CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
@@ -39,7 +40,12 @@ DEFAULTS = dict(auto=True, recent_days=30, clean_on=False, clean_days=30, cap_on
                 sort_key="time", sort_desc=True, settle_sec=10, rules=[], root="", by_month=True,
                 loose_dirs=False, zip_fmt="zip", zip_level=5, zip_method="aes", unzip_mode="smart",
                 unzip_overwrite="rename", unzip_open=True, unzip_recycle=False, pw_book=[], tour_done=False,
-                folders=[], extra_skip="", schemes=[])
+                folders=[], extra_skip="", schemes=[], update_mode="notify", update_last=0.0, update_skip="",
+                name_suffixes=["_已签字", "_最终版", "_{date}"],
+                ext_list=[".zip", ".rar", ".7z", ".txt", ".jpg", ".png", ".pdf", ".mp4"])
+UPDATE_MODES = [("auto", "自动更新：后台下载，窗口不在前台时自动安装"),
+                ("notify", "手动更新：发现新版本时提醒我，由我决定"),
+                ("off", "不自动检查（可在“关于”里手动检查）")]
 # 其他文件夹（桌面、聊天软件的接收目录等）里默认不动的类型：快捷方式、程序 / 脚本（可能是绿色软件）、
 # 配置和数据文件——它们往往被某个程序按固定路径读取，挪走会让程序找不到
 DEFAULT_EXTRA_SKIP = (".lnk .url .exe .com .bat .cmd .ps1 .vbs .reg .msc .scr .dll .sys .ini .cfg .conf .json .xml "
@@ -956,6 +962,14 @@ def sanitize_cfg(raw):
         c["theme"] = DEFAULTS["theme"]
     if c["close"] not in ("tray", "quit"):
         c["close"] = DEFAULTS["close"]
+    if c["update_mode"] not in [k for k, _ in UPDATE_MODES]:
+        c["update_mode"] = DEFAULTS["update_mode"]
+    sfx = raw.get("name_suffixes", c["name_suffixes"])      # 只丢掉不合法的那几个后缀，其余保留
+    sfx = [x for x in sfx if isinstance(x, str) and not parse_suffixes(x)[1]] if isinstance(sfx, list) else []
+    c["name_suffixes"] = parse_suffixes("\n".join(sfx))[0]
+    exts = raw.get("ext_list", c["ext_list"])
+    exts = [x for x in exts if isinstance(x, str) and not parse_ext_list(x)[1]] if isinstance(exts, list) else []
+    c["ext_list"] = parse_ext_list(" ".join(exts))[0]
     # 规则方案：名称不能重复、不能和“主文件夹规则”同名，规则不合法的方案丢弃
     schemes, seen = [], {PRIMARY_SCHEME.lower()}
     if isinstance(raw.get("schemes"), list):
@@ -1097,6 +1111,89 @@ def free_path(d, name):
         dest = os.path.join(d, f"{base} ({i}){ext}")
         i += 1
     return dest
+
+
+def rename_target(src, new):
+    """重命名的目标路径：新名字已被别的文件占用时自动加上 (1)、(2)…；
+    只改大小写（a.txt → A.txt）或名字不变时，就用原名字。"""
+    dst = os.path.join(os.path.dirname(src), new)
+    if not os.path.lexists(dst) or os.path.normcase(os.path.abspath(dst)) == os.path.normcase(os.path.abspath(src)):
+        return dst
+    return archive.unique_path(dst, keep_ext=not os.path.isdir(src))
+
+
+MAX_SUFFIXES = 20
+
+
+def suffix_text(sfx):
+    """快速后缀里的 {date} 换成今天的日期（20261125）。"""
+    return sfx.replace("{date}", time.strftime("%Y%m%d"))
+
+
+def add_suffix_name(path, sfx):
+    """在文件名（扩展名之前）加上后缀：报告.pdf + _已签字 → 报告_已签字.pdf；文件夹直接加在末尾。
+    已经以这个后缀结尾时返回 None（不重复添加）。"""
+    name = os.path.basename(path)
+    if os.path.isdir(path):
+        base, ext = name, ""
+    else:
+        base, ext = os.path.splitext(name)
+        if base.lower().endswith(".tar"):
+            base, ext = base[:-4], ".tar" + ext
+    t = suffix_text(sfx)
+    if not t or base.endswith(t):
+        return None
+    return base + t + ext
+
+
+def parse_suffixes(text):
+    """每行一个后缀；去掉空行和重复。返回 (列表, 错误)：有不能用在文件名里的字符时报错。"""
+    out, seen = [], set()
+    for line in (text or "").splitlines():
+        x = line.strip()
+        if not x or x in seen:
+            continue
+        if len(x) > 40:
+            return out, f"“{x[:20]}…”太长（最多 40 个字）"
+        if bad_filename("a" + suffix_text(x) + ".txt") or x.endswith("."):
+            return out, f"“{x}”里有文件名不能用的字符（\\ / : * ? \" < > |）"
+        seen.add(x)
+        out.append(x)
+    if len(out) > MAX_SUFFIXES:
+        return out[:MAX_SUFFIXES], f"最多 {MAX_SUFFIXES} 个"
+    return out, ""
+
+
+MAX_EXTS = 20
+
+
+def split_ext(name):
+    """文件名拆成 (主名, 扩展名)；.tar.gz / .tar.xz 这类当成一个扩展名。"""
+    base, ext = os.path.splitext(name)
+    if base.lower().endswith(".tar"):
+        base, ext = base[:-4], ".tar" + ext
+    return base, ext
+
+
+def change_ext_name(path, ext):
+    """把扩展名换成 ext（ext 为空 = 去掉扩展名）；文件夹、扩展名没变化时返回 None。"""
+    if os.path.isdir(path):
+        return None
+    base, old = split_ext(os.path.basename(path))
+    if not base or old.lower() == ext.lower():
+        return None
+    return base + ext
+
+
+def parse_ext_list(text):
+    """“zip, .RAR  7z” → ([".zip", ".rar", ".7z"], 错误)。"""
+    out = parse_exts(text or "")
+    for e in out:
+        if len(e) > 16 or bad_filename("a" + e) or e.endswith("."):
+            return [x for x in out if x != e], f"“{e}”不能用作扩展名"
+    if len(out) > MAX_EXTS:
+        return out[:MAX_EXTS], f"最多 {MAX_EXTS} 个"
+    return out, ""
 
 
 def is_partial(name, names):
@@ -2836,6 +2933,7 @@ class Main(QWidget):
         self.clean_timer.start()
         if self.cfg.get("autostart"):
             set_autostart(True)   # 程序位置变化（重新安装）后修正开机启动路径
+        self.start_update_timer()
         log("自动整理文件管理器已启动，管理：" + ROOT)
         if start_hidden:
             # 开机后台启动：只整理和监视下载根目录，列表与缩略图等到第一次打开窗口再加载
@@ -3310,7 +3408,7 @@ class Main(QWidget):
         s_open = Switch()
         s_open.setChecked(bool(self.cfg["unzip_open"]))
         s_open.toggled.connect(lambda on: self.set_cfg("unzip_open", bool(on)))
-        row(c, "解压完成后打开文件夹", s_open)
+        row(c, "解压完成后在应用内打开文件夹", s_open, sub="直接在本程序的列表里显示解压出来的文件，不会弹出资源管理器窗口")
         s_rec = Switch()
         s_rec.setChecked(bool(self.cfg["unzip_recycle"]))
         s_rec.toggled.connect(lambda on: self.set_cfg("unzip_recycle", bool(on)))
@@ -3340,6 +3438,8 @@ class Main(QWidget):
         cb.setCurrentIndex(0 if self.cfg["close"] == "tray" else 1)
         cb.currentIndexChanged.connect(lambda i: self.set_cfg("close", "tray" if i == 0 else "quit"))
         row(c, "点击 ✕ 关闭窗口时", cb)
+        row(c, "版本更新", combo("update_mode", UPDATE_MODES),
+            sub="从 GitHub 检查新版本；安装包下载后校验 SHA-256，一致才会安装")
 
         section("移动记录")
         c = card("移动记录",
@@ -3386,6 +3486,19 @@ class Main(QWidget):
         b_tour = QPushButton("重新查看新手教程")
         b_tour.clicked.connect(lambda: self.start_tour())
         row(c, f"自动整理文件管理器 v{VERSION}", b_help, b_tour, sub="设置、背景图与密码本保存在 " + CFG_DIR)
+        self.b_upd = QPushButton("检查更新")
+        self.b_upd.clicked.connect(self.on_update_button)
+        r = QHBoxLayout()
+        tv = QVBoxLayout()
+        tv.setSpacing(0)
+        tv.addWidget(QLabel("检查更新"))
+        self.upd_sub = QLabel(objectName="hint")
+        self.upd_sub.setWordWrap(True)
+        tv.addWidget(self.upd_sub)
+        r.addLayout(tv, 1)
+        r.addWidget(self.b_upd)
+        c.addLayout(r)
+        self.refresh_update_row()
         for v in layouts:
             v.addStretch()
         tabs.addStretch()
@@ -5111,37 +5224,190 @@ class Main(QWidget):
         if len(s) != 1:
             return
         old = os.path.basename(s[0])
-        d = Dialog(self, "重命名", "输入新的文件名：", ok="重命名", edit=old)
-        if d.exec():
+        folder = os.path.dirname(s[0])
+        st = dict(name=None, dst=None)
+
+        def check():
+            # 名字有问题时在对话框里提示、不关闭，输入的内容不会丢；
+            # 和已有文件重名：提示一次，再点“重命名”就自动保存为“名字 (1).扩展名”
             new = d.value()
             if not new or new == old:
-                return
+                return ""
             err = bad_filename(new)
             if err:
-                self.show_toast(err)
+                return err
+            dst = rename_target(s[0], new)
+            if dst != os.path.join(folder, new) and st["name"] != new:
+                st["name"] = new
+                d.ok_btn.setText("用新名字保存")
+                return f"已有同名文件“{new}”。再点一次将保存为“{os.path.basename(dst)}”，或改一个名字。"
+            st["dst"] = dst
+            return ""
+
+        d = Dialog(self, "重命名", "输入新的文件名：", ok="重命名", edit=old, validate=check)
+        d.edit.textEdited.connect(lambda _: (st.update(name=None), d.ok_btn.setText("重命名"), d.err.hide()))
+        if d.exec():
+            dst = st["dst"]
+            if not dst:
                 return
+            new = os.path.basename(dst)
             try:
-                dst = os.path.join(os.path.dirname(s[0]), new)
-                if os.path.exists(dst) and os.path.normcase(dst) != os.path.normcase(s[0]):
-                    self.show_toast("已有同名文件")
-                    return
                 os.rename(s[0], dst)
                 log(f"重命名：{old} → {new}")
-                # 新名字按规则属于另一个分类（改了扩展名，或加上 / 去掉了关键词）：放到新分类里
-                r = root_of(s[0]) or ROOT
-                parts = os.path.relpath(s[0], cat_base(r)).split(os.sep)
-                new_cat = category_for(new, r)
-                if not self.browse and not os.path.isdir(dst) and len(parts) > 1 and parts[0] in cats_for(r) and parts[0] != new_cat \
-                        and new_cat != category_for(old, r):
-                    try:
-                        move_to(dst, new_cat, journal.batch("重命名后换分类"))
-                        remove_empty_dirs()
-                        self.show_toast(f"按分类规则已移到“{new_cat}”")
-                    except OSError:
-                        self.show_toast("已重命名，但移到新分类失败")
+                cat = self.recat_after_rename(s[0], dst)
+                if cat:
+                    remove_empty_dirs()
+                    self.show_toast(f"按分类规则已移到“{cat}”")
+                elif cat is not None:
+                    self.show_toast("已重命名，但移到新分类失败")
             except OSError as e:
                 self.show_toast(f"重命名失败：{e.strerror or e}")
             self.tick()
+
+    def recat_after_rename(self, src, dst, batch=None):
+        """新名字按规则属于另一个分类（改了扩展名，或加上 / 去掉了关键词）：放到新分类里。
+        返回新分类名；不需要移动时返回 None；移动失败返回 ""。"""
+        old, new = os.path.basename(src), os.path.basename(dst)
+        r = root_of(src) or ROOT
+        parts = os.path.relpath(src, cat_base(r)).split(os.sep)
+        new_cat = category_for(new, r)
+        if self.browse or os.path.isdir(dst) or len(parts) < 2 or parts[0] not in cats_for(r) or parts[0] == new_cat \
+                or new_cat == category_for(old, r):
+            return None
+        try:
+            move_to(dst, new_cat, batch or journal.batch("重命名后换分类"))
+            return new_cat
+        except OSError:
+            return ""
+
+    # ---------- 快速加后缀 ----------
+    def suffix_menu(self):
+        m = QMenu("快速加后缀", self)
+        for x in self.cfg["name_suffixes"]:
+            t = suffix_text(x)
+            m.addAction(("…" + t).replace("&", "&&") + ("" if t == x else f"（{x}）".replace("&", "&&")),
+                        lambda x=x: self.suffix_selected(x))
+        if self.cfg["name_suffixes"]:
+            m.addSeparator()
+        m.addAction("自定义后缀…", self.edit_suffixes)
+        return m
+
+    def suffix_selected(self, sfx):
+        paths = self.selected()
+        done, same, failed, moved = 0, 0, 0, 0
+        b = journal.batch("加后缀后换分类")
+        for p in paths:
+            new = add_suffix_name(p, sfx)
+            if not new:
+                same += 1
+                continue
+            if bad_filename(new):
+                failed += 1
+                continue
+            dst = rename_target(p, new)       # 和已有文件重名时自动加 (1)
+            try:
+                os.rename(p, dst)
+            except OSError:
+                failed += 1
+                continue
+            done += 1
+            log(f"重命名：{os.path.basename(p)} → {os.path.basename(dst)}")
+            if self.recat_after_rename(p, dst, b):
+                moved += 1
+        if moved:
+            remove_empty_dirs()
+        msg = f"已给 {done} 个{'项目' if len(paths) > 1 else '文件'}加上“{suffix_text(sfx)}”" if done else "没有重命名任何文件"
+        if same:
+            msg += f"，{same} 个已有这个后缀"
+        if failed:
+            msg += f"，{failed} 个失败（可能正被占用）"
+        if moved:
+            msg += f"，{moved} 个按分类规则换了分类"
+        self.show_toast(msg)
+        self.tick()
+
+    # ---------- 快速更改扩展名 ----------
+    def ext_menu(self):
+        m = QMenu("更改扩展名", self)
+        files = [p for p in self.selected() if not os.path.isdir(p)]
+        cur = {split_ext(os.path.basename(p))[1].lower() for p in files}
+        for e in self.cfg["ext_list"]:
+            a = m.addAction(e, lambda e=e: self.ext_selected(e))
+            a.setEnabled(bool(files) and cur != {e})      # 全都已经是这个扩展名：灰掉
+        if self.cfg["ext_list"]:
+            m.addSeparator()
+        m.addAction("其他扩展名…", self.ext_other)
+        a = m.addAction("去掉扩展名", lambda: self.ext_selected(""))
+        a.setEnabled(bool(files) and cur != {""})
+        m.addSeparator()
+        m.addAction("自定义扩展名列表…", self.edit_ext_list)
+        m.menuAction().setEnabled(bool(files))
+        return m
+
+    def ext_selected(self, ext):
+        """只改文件名里的扩展名，不转换文件内容（转换请用“转换为 ▸”）。"""
+        paths = [p for p in self.selected() if not os.path.isdir(p)]
+        done, same, failed, moved = 0, 0, 0, 0
+        b = journal.batch("改扩展名后换分类")
+        for p in paths:
+            new = change_ext_name(p, ext)
+            if not new:
+                same += 1
+                continue
+            if bad_filename(new):
+                failed += 1
+                continue
+            dst = rename_target(p, new)       # 和已有文件重名时自动加 (1)
+            try:
+                os.rename(p, dst)
+            except OSError:
+                failed += 1
+                continue
+            done += 1
+            log(f"重命名：{os.path.basename(p)} → {os.path.basename(dst)}")
+            if self.recat_after_rename(p, dst, b):
+                moved += 1
+        if moved:
+            remove_empty_dirs()
+        if done:
+            msg = (f"已把 {done} 个文件改成 {ext}" if ext else f"已去掉 {done} 个文件的扩展名") + "（只改名字，内容没有转换）"
+        else:
+            msg = "没有更改任何文件"
+        if same:
+            msg += f"，{same} 个本来就是"
+        if failed:
+            msg += f"，{failed} 个失败（可能正被占用）"
+        if moved:
+            msg += f"，{moved} 个按分类规则换了分类"
+        self.show_toast(msg)
+        self.tick()
+
+    def ext_other(self):
+        d = Dialog(self, "更改扩展名", "输入新的扩展名（如 zip 或 .zip）。只改文件名，不会转换文件内容。",
+                   ok="更改", edit="", validate=lambda: (lambda r: r[1] or ("" if len(r[0]) == 1 else "请输入一个扩展名"))(
+                       parse_ext_list(d.value())))
+        if d.exec():
+            self.ext_selected(parse_ext_list(d.value())[0][0])
+
+    def edit_ext_list(self):
+        box = QLineEdit(" ".join(self.cfg["ext_list"]))
+        d = Dialog(self, "自定义扩展名列表",
+                   f"右键“更改扩展名 ▸”里列出的扩展名，用空格或逗号分开（如 zip rar 7z jpg png），最多 {MAX_EXTS} 个。",
+                   ok="保存", extra=box, validate=lambda: parse_ext_list(box.text())[1])
+        if d.exec():
+            self.set_cfg("ext_list", parse_ext_list(box.text())[0])
+            self.show_toast("扩展名列表已保存")
+
+    def edit_suffixes(self):
+        box = QPlainTextEdit("\n".join(self.cfg["name_suffixes"]))
+        box.setMinimumHeight(150)
+        d = Dialog(self, "自定义快速后缀",
+                   "每行一个后缀，加在文件名和扩展名之间（报告.pdf → 报告_已签字.pdf）。"
+                   "写 {date} 会换成当天日期，如 _{date} → _" + time.strftime("%Y%m%d") + f"。最多 {MAX_SUFFIXES} 个。",
+                   ok="保存", extra=box, validate=lambda: parse_suffixes(box.toPlainText())[1])
+        if d.exec():
+            self.set_cfg("name_suffixes", parse_suffixes(box.toPlainText())[0])
+            self.show_toast("快速后缀已保存")
 
     def move_menu(self):
         m = QMenu(self)
@@ -5184,6 +5450,8 @@ class Main(QWidget):
         m.addAction("打开所在位置", self.reveal_selected)
         if len(self.selected()) == 1:
             m.addAction("重命名\tF2", self.rename_selected)
+        m.addMenu(self.suffix_menu())
+        m.addMenu(self.ext_menu())
         mv = self.move_menu()
         mv.setTitle("移动到")
         m.addMenu(mv)
@@ -5524,7 +5792,7 @@ class Main(QWidget):
         for k, text in OVERWRITE_MODES:
             over.addItem(text, k)
         over.setCurrentIndex(max(0, over.findData(self.cfg["unzip_overwrite"])))
-        open_ = QCheckBox("完成后打开文件夹")
+        open_ = QCheckBox("完成后在应用内打开文件夹")
         open_.setChecked(bool(self.cfg["unzip_open"]))
         rec = QCheckBox("解压成功后把压缩包移到回收站")
         rec.setChecked(bool(self.cfg["unzip_recycle"]))
@@ -5623,13 +5891,14 @@ class Main(QWidget):
                 recycle([v for p, _, _ in ok for v in archive.volumes(p)])
             except OSError as e:
                 bad.append(("移到回收站", str(e)))
-        if ok and opts["open"] and not quiet:
-            r = ok[0][1] if len(ok) == 1 else (opts["dest"] or os.path.dirname(ok[0][0]))
-            if os.path.isdir(r):
-                self.open_path(r)
-            else:
-                reveal_in_explorer(r)
         self.tick()
+        if ok and opts["open"] and not quiet:
+            # 在应用内的列表里打开解压出来的文件夹，不弹出资源管理器
+            r = ok[0][1] if len(ok) == 1 else (opts["dest"] or os.path.dirname(ok[0][0]))
+            if not os.path.isdir(r):
+                r = os.path.dirname(r)
+            if os.path.isdir(r) and root_of(r) and self.isVisible():
+                self.enter_folder(r)
         if bad and not quiet:
             Dialog(self, "解压", (f"已解压 {len(ok)} 个，" if ok else "") + f"{len(bad)} 个没有解压：\n\n"
                    + "\n".join(f"· {os.path.basename(p)}：{m}" for p, m in bad[:10]), ok="知道了").exec()
@@ -5731,6 +6000,173 @@ class Main(QWidget):
         refresh()
         Dialog(self, "解压密码本", "解压有密码的压缩包时，会先试你输入的密码，再依次试这里的密码。"
                "密码用你的 Windows 账户加密后保存在本机，换电脑或换账户后无法读取。", ok="完成", extra=box).exec()
+
+    # ---------- 版本更新 ----------
+    def start_update_timer(self):
+        self.update_info = None            # 发现的新版本（updater.check 的结果）
+        self.update_file = None            # 已下载并校验好的安装包
+        self.update_state = ""
+        self.update_timer = QTimer(self, interval=60 * 60 * 1000, timeout=self.auto_check_update)
+        self.update_timer.start()
+        self.install_timer = QTimer(self, interval=60 * 1000, timeout=self.try_auto_install)
+        self.update_msg = False             # 最近一条托盘通知是不是“发现新版本”
+        self.tray.messageClicked.connect(lambda: self.update_msg and self.update_info and (self.show_main(), self.prompt_update()))
+        QTimer.singleShot(60 * 1000, self.auto_check_update)     # 启动一分钟后再查，不拖慢启动
+        self.refresh_update_row()
+
+    def auto_check_update(self):
+        if self.cfg["update_mode"] == "off" or self.update_file or self.update_state:
+            return
+        if 0 <= time.time() - float(self.cfg.get("update_last") or 0) < 20 * 3600:
+            return                         # 每天最多自动检查一次
+        self.check_update(manual=False)
+
+    def check_update(self, manual=True):
+        if self.update_state:
+            self.show_toast(self.update_state)
+            return
+        self.update_state = "正在检查更新…"
+        self.refresh_update_row()
+        if manual:
+            self.show_toast(self.update_state)
+        self.run_task("update", lambda: updater.check(VERSION), lambda res, err: self.on_update_checked(res, err, manual))
+
+    def on_update_checked(self, info, err, manual):
+        self.update_state = ""
+        if err is None:
+            self.cfg["update_last"] = time.time()
+            save_cfg(self.cfg)
+            self.update_info = info
+        self.refresh_update_row(f"检查失败：{err}" if err else "")
+        if err:
+            log(f"检查更新失败：{err}")
+            if manual:
+                self.show_toast(f"检查更新失败：{err}")
+            return
+        if not info:
+            if manual:
+                self.show_toast(f"已是最新版本 v{VERSION}")
+            return
+        log(f"发现新版本 v{info['version']}")
+        if manual:
+            self.prompt_update()
+        elif self.cfg["update_mode"] == "auto" and updater.can_install(info) and getattr(sys, "frozen", False):
+            self.download_update(auto=True)
+        elif self.cfg.get("update_skip") != info["version"]:
+            self.update_msg = True
+            self.tray.showMessage(APP_NAME, f"发现新版本 v{info['version']}，点这里查看并更新。", self.app_icon, 8000)
+            self.show_toast(f"发现新版本 v{info['version']}，可在 设置 → 关于 中更新")
+
+    def refresh_update_row(self, extra=""):
+        if not hasattr(self, "upd_sub") or not hasattr(self, "update_state"):
+            return
+        info = self.update_info
+        if self.update_state:
+            text, btn = self.update_state, "检查更新"
+        elif self.update_file and info:
+            text, btn = f"新版本 v{info['version']} 已下载并校验，点“立即安装”完成更新", "立即安装"
+        elif info:
+            text, btn = f"发现新版本 v{info['version']}（当前 v{VERSION}）", "查看并更新"
+        else:
+            last = float(self.cfg.get("update_last") or 0)
+            text = f"当前 v{VERSION}" + (f"，上次检查 {datetime.fromtimestamp(last):%Y-%m-%d %H:%M}" if last > 0 else "")
+            btn = "检查更新"
+        self.upd_sub.setText(extra or text)
+        self.b_upd.setText(btn)
+        self.b_upd.setEnabled(not self.update_state)
+
+    def on_update_button(self):
+        if self.update_file:
+            self.install_update(show=True)
+        elif self.update_info:
+            self.prompt_update()
+        else:
+            self.check_update(manual=True)
+
+    def prompt_update(self):
+        info = self.update_info
+        if not info:
+            return
+        notes = info["notes"]
+        notes = notes if len(notes) <= 600 else notes[:600] + "…"
+        skip = QCheckBox("跳过这个版本（不再提醒）")
+        skip.setChecked(self.cfg.get("update_skip") == info["version"])
+        ok_install = updater.can_install(info) and getattr(sys, "frozen", False)
+        msg = f"新版本 v{info['version']}（当前 v{VERSION}）\n\n{notes or '（没有更新说明）'}\n\n" + (
+            "点“立即更新”会下载安装包并校验，然后自动关闭本程序、安装新版本并重新打开；设置和记录都会保留。"
+            if ok_install else "将打开 GitHub 发布页，请下载安装包后运行。")
+        d = Dialog(self, "发现新版本", msg, ok="立即更新" if ok_install else "打开发布页", extra=skip)
+        accepted = d.exec()
+        self.set_cfg("update_skip", info["version"] if skip.isChecked() and not accepted else "")
+        if not accepted:
+            return
+        if ok_install:
+            self.download_update(auto=False)
+        else:
+            QDesktopServices.openUrl(QUrl(info["page"]))
+
+    def download_update(self, auto):
+        info = self.update_info
+        if not info or self.update_state:
+            return
+        self.update_state = f"正在下载 v{info['version']}…"
+        self.refresh_update_row()
+        if not auto:
+            self.show_toast(self.update_state + "可以继续使用")
+        self.run_task("update", lambda: updater.download(info),
+                      lambda res, err: self.on_update_downloaded(res, err, auto))
+
+    def on_update_downloaded(self, path, err, auto):
+        self.update_state = ""
+        if err:
+            log(f"下载更新失败：{err}")
+            self.refresh_update_row(f"下载失败：{err}")
+            if not auto:
+                self.show_toast(f"下载更新失败：{err}")
+            return
+        self.update_file = path
+        log(f"新版本 v{self.update_info['version']} 已下载并校验")
+        self.refresh_update_row()
+        if not auto:
+            self.install_update(show=True)
+        else:
+            self.install_timer.start()
+            self.try_auto_install()
+
+    def app_busy(self):
+        if self.job is not None and self.job.isRunning():
+            return True
+        w = getattr(self, "_clean_worker", None)
+        if w is not None and w.isRunning():
+            return True
+        return any(k != "update" and t.isRunning() for k, t in self.__dict__.get("_tasks", {}).items())
+
+    def try_auto_install(self):
+        """自动更新：等窗口不在前台（隐藏到托盘或最小化）、也没有进行中的任务时再安装，不打断正在做的事。"""
+        if not self.update_file or self.cfg["update_mode"] != "auto":
+            self.install_timer.stop()
+            return
+        if (self.isVisible() and not self.isMinimized()) or self.app_busy() or QApplication.activeModalWidget():
+            return
+        self.install_timer.stop()
+        self.install_update(show=False)
+
+    def install_update(self, show):
+        path = self.update_file
+        if not path or not os.path.isfile(path):
+            self.update_file = None
+            self.refresh_update_row()
+            return
+        if self.app_busy():
+            self.show_toast("还有任务在进行，完成后再安装更新")
+            return
+        # 安装程序会先结束本程序、再覆盖文件；这里先自己退出，避免文件被占用导致安装失败
+        ok = QProcess.startDetached(path, updater.installer_args(show), os.path.dirname(path))
+        if not (ok[0] if isinstance(ok, tuple) else ok):
+            self.show_toast("无法启动安装程序")
+            return
+        log("开始安装新版本")
+        self.quit()
 
     def run_task(self, key, fn, on_done):
         """后台运行 fn；同一个 key 的任务正在运行时不重复启动。返回是否已启动。"""
@@ -5992,6 +6428,7 @@ class Main(QWidget):
             self.hide()
             if not self.told_tray:
                 self.told_tray = True
+                self.update_msg = False
                 self.tray.showMessage(APP_NAME, "仍在后台运行，会继续自动整理。右键托盘图标可退出。", self.app_icon, 3000)
         else:
             self.quit()

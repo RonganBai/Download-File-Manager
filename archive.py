@@ -439,29 +439,36 @@ def _place(path, tmp, dest_dir, mode, overwrite, discard=None):
 def _merge(src, dst, policy, discard=None):
     os.makedirs(dst, exist_ok=True)
     for name in os.listdir(src):
-        s, d = os.path.join(src, name), os.path.join(dst, name)
-        if not os.path.lexists(d):
-            os.replace(s, d)
-        elif os.path.isdir(s) and os.path.isdir(d) and not os.path.islink(d):
-            _merge(s, d, policy, discard)
-        elif policy == "skip":
-            continue
-        elif policy == "overwrite" and os.path.isfile(s) and os.path.isfile(d):
-            if discard is not None:
-                try:
-                    gone = discard(d) and not os.path.lexists(d)
-                except OSError:
-                    gone = False
-                if not gone:                     # 旧文件没能放进回收站：两份都保留
-                    os.replace(s, unique_path(d, keep_ext=True))
-                    continue
+        merge_one(os.path.join(src, name), os.path.join(dst, name), policy, discard)
+
+
+def merge_one(s, d, policy, discard=None):
+    """把 s 放到 d：d 已存在时按 policy 处理（文件夹合并）。返回最终路径；跳过时返回 None。"""
+    if not os.path.lexists(d):
+        os.replace(s, d)
+    elif os.path.isdir(s) and os.path.isdir(d) and not os.path.islink(d):
+        _merge(s, d, policy, discard)
+    elif policy == "skip":
+        return None
+    elif policy == "overwrite" and os.path.isfile(s) and os.path.isfile(d):
+        if discard is not None:
             try:
+                gone = discard(d) and not os.path.lexists(d)
+            except OSError:
+                gone = False
+            if not gone:                     # 旧文件没能放进回收站：两份都保留
+                d = unique_path(d, keep_ext=True)
                 os.replace(s, d)
-            except PermissionError:          # 只读文件：去掉只读属性再覆盖
-                os.chmod(d, 0o666)
-                os.replace(s, d)
-        else:
-            os.replace(s, unique_path(d, keep_ext=os.path.isfile(s)))
+                return d
+        try:
+            os.replace(s, d)
+        except PermissionError:          # 只读文件：去掉只读属性再覆盖
+            os.chmod(d, 0o666)
+            os.replace(s, d)
+    else:
+        d = unique_path(d, keep_ext=os.path.isfile(s))
+        os.replace(s, d)
+    return d
 
 
 def _extract_raw(path, out, password, progress, cancel):

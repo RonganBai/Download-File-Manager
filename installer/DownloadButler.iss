@@ -2,7 +2,7 @@
 #define AppName "自动整理文件管理器"
 ; 旧名称：开机启动项的名字沿用它（程序内也用它读写），旧版的快捷方式在升级时删除
 #define OldName "下载管家"
-#define AppVersion "2.10.0"
+#define AppVersion "2.10.1"
 #define AppPublisher "RonganBai"
 #define AppExe "DownloadButler.exe"
 #ifndef DistDir

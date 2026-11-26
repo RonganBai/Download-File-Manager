@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (QApplication, QSizePolicy, QWidget, QFrame, QLabel,
                              QStackedWidget, QScrollArea, QCheckBox, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextBrowser,
                              QProgressBar, QSystemTrayIcon, QDialog, QFileDialog, QHeaderView, QSlider)
 
-VERSION = "2.10.0"
+VERSION = "2.10.1"
 APP = "下载管家"          # 内部标识：配置目录、开机启动项、密码本加密用它，改名后保持不变以免丢失设置
 APP_NAME = "自动整理文件管理器"     # 显示给用户的名称
 CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
@@ -39,7 +39,7 @@ DEFAULTS = dict(auto=True, recent_days=30, clean_on=False, clean_days=30, cap_on
                 accent="blue", bg_image="", bg_vis=35, card_alpha=88, win_opacity=100, img_colors=[],
                 sort_key="time", sort_desc=True, settle_sec=10, rules=[], root="", by_month=True,
                 loose_dirs=False, zip_fmt="zip", zip_level=5, zip_method="aes", unzip_mode="smart",
-                unzip_overwrite="rename", unzip_open=True, unzip_recycle=False, pw_book=[], tour_done=False,
+                unzip_overwrite="rename", unzip_open=True, unzip_recycle=False, unzip_sort=True, pw_book=[], tour_done=False,
                 folders=[], extra_skip="", schemes=[], update_mode="notify", update_last=0.0, update_skip="",
                 name_suffixes=["_已签字", "_最终版", "_{date}"],
                 ext_list=[".zip", ".rar", ".7z", ".txt", ".jpg", ".png", ".pdf", ".mp4"])
@@ -515,6 +515,24 @@ def validate_rules(rows):
     return out, ""
 
 
+VOLUME_RE = re.compile(r"\.(?:(\d{3})|(z\d{2})|(r\d{2}))$", re.I)
+
+
+def volume_name(filename):
+    """分卷压缩包换成它所属压缩包的名字，用来判断分类：
+    视频.zip.003 → 视频.zip，资料.z01 → 资料.zip，资料.r00 → 资料.rar，电影.mkv.001（切分的文件）→ 电影.mkv.7z。
+    不是分卷时原样返回。"""
+    m = VOLUME_RE.search(filename)
+    if not m:
+        return filename
+    stem = filename[:m.start()]
+    if m.group(2):
+        return stem + ".zip"
+    if m.group(3):
+        return stem + ".rar"
+    return stem if archive.is_archive(stem) else stem + ".7z"
+
+
 class RuleSet:
     """一套编译好的分类规则（分类列表、扩展名映射、关键词）。
     主文件夹用 PRIMARY；其他文件夹可以选用自己的“规则方案”，彼此独立。"""
@@ -540,8 +558,9 @@ class RuleSet:
                 self.ext_map[e] = n
 
     def category_for(self, filename):
-        """文件应归入的分类：先看关键词分类（按规则顺序），再按扩展名。"""
-        base, ext = os.path.splitext(filename)
+        """文件应归入的分类：先看关键词分类（按规则顺序），再按扩展名。
+        分卷压缩包（视频.zip.003、资料.z01、资料.r00）按压缩包算。"""
+        base, ext = os.path.splitext(volume_name(filename))
         ext = ext.lower()
         low = base.lower()
         for n, exts, pats in self.keywords:
@@ -2109,6 +2128,70 @@ def remove_empty_dirs():
             pass
 
 
+def archive_home(path):
+    """压缩包直接放在某个分类文件夹（或其“年-月”子文件夹）里时返回 (管理的文件夹, 分类)；否则 None。
+    放在根目录、未整理的位置、或整个归档进来的文件夹里面时返回 None（解压结果原地放，不拆散那个文件夹）。"""
+    r = root_of(path)
+    if not r:
+        return None
+    parts = os.path.relpath(os.path.dirname(path), cat_base(r)).split(os.sep)
+    if parts[0] in (os.curdir, os.pardir) or parts[0] not in root_cats(r):
+        return None
+    if len(parts) > 2 or len(parts) == 2 and not re.fullmatch(r"\d{4}-\d{2}", parts[1]):
+        return None
+    return r, parts[0]
+
+
+def extract_sorted(path, home, opts, password, book, progress, cancel):
+    """压缩包在分类文件夹里时：先解压到旁边的临时文件夹，再把解压出来的东西放进各自的分类
+    （文件按类型 / 关键词，文件夹按其中占用空间最多的文件类型；程序文件夹等判断不了的留在压缩包旁边）。
+    返回 (第一个放好的路径, 用上的密码)。"""
+    r = home[0]
+    here = os.path.dirname(path)
+    stage = os.path.join(here, TEMP_PREFIX + "x" + hashlib.md5(os.urandom(8)).hexdigest()[:10])
+    try:
+        res, used = archive.extract(path, stage, opts["mode"], opts["overwrite"], password, book, progress, cancel,
+                                    discard=recycle_old)
+        items = [os.path.join(stage, n) for n in os.listdir(stage)] if opts["mode"] == "here" else [res]
+        placed = []
+        for src in items:
+            name = os.path.basename(src)
+            try:
+                cat = dir_category(src, r) if os.path.isdir(src) else category_for(name, r)
+                # 和压缩包同一分类（或判断不了）：就放在压缩包旁边，跟原来一样
+                d = cat_dir(cat, os.stat(src).st_mtime, r) if cat and cat != home[1] else here
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                cat, d = None, here
+            dst = merge_into(src, d, name, opts)
+            if dst:
+                placed.append(dst)
+                if cat and cat != home[1]:
+                    opts["sorted"].append(cat)
+                    log(f"解压后归类：{name} → {cat}")
+        return (placed[0] if placed else here), used
+    finally:
+        left = os.listdir(stage) if os.path.isdir(stage) else []
+        for n in left:                       # 万一中途出错：剩下的放回压缩包旁边，绝不丢
+            try:
+                merge_into(os.path.join(stage, n), here, n, opts)
+            except OSError:
+                pass
+        try:
+            os.rmdir(stage)
+        except OSError:
+            pass
+
+
+def merge_into(src, d, name, opts):
+    """把 src 放进文件夹 d：“直接放出”方式按同名文件设置合并，其他方式自动改名。"""
+    if opts["mode"] == "here":
+        return archive.merge_one(src, os.path.join(d, name), opts["overwrite"], recycle_old)
+    dst = archive.unique_path(os.path.join(d, name), keep_ext=os.path.isfile(src))
+    os.replace(src, dst)
+    return dst
+
+
 def move_to(path, dest, batch=None):
     """移到分类（在文件所在的管理文件夹里）或任意文件夹；记入移动记录。返回新路径。"""
     name = os.path.basename(path)
@@ -3413,6 +3496,12 @@ class Main(QWidget):
         s_rec.setChecked(bool(self.cfg["unzip_recycle"]))
         s_rec.toggled.connect(lambda on: self.set_cfg("unzip_recycle", bool(on)))
         row(c, "解压成功后把压缩包移到回收站", s_rec, sub="分卷压缩包的所有分卷一起移走；可以在回收站还原")
+        s_sort = Switch()
+        s_sort.setChecked(bool(self.cfg["unzip_sort"]))
+        s_sort.toggled.connect(lambda on: self.set_cfg("unzip_sort", bool(on)))
+        row(c, "解压出来的文件按分类放好", s_sort,
+            sub="压缩包在分类文件夹（如“压缩包”）里时，解压出的视频放进“视频”、文档放进“文档”，不再留在“压缩包”里；"
+                "自己选了解压位置时不移动")
         b_pw = QPushButton("管理密码本…")
         b_pw.clicked.connect(self.manage_pw_book)
         self.pw_sub = QLabel(objectName="hint")
@@ -5822,7 +5911,8 @@ class Main(QWidget):
         opts = dict(mode=mode or self.cfg["unzip_mode"], dest=dest, password=password,
                     overwrite=overwrite or self.cfg["unzip_overwrite"],
                     open=self.cfg["unzip_open"] if open_after is None else open_after,
-                    recycle=self.cfg["unzip_recycle"] if recycle_after is None else recycle_after)
+                    recycle=self.cfg["unzip_recycle"] if recycle_after is None else recycle_after,
+                    sort=bool(self.cfg["unzip_sort"]) and not dest, sorted=[])
         self.run_extract(list(arcs), opts, password, [])
 
     def run_extract(self, queue, opts, first_pw, results):
@@ -5837,10 +5927,14 @@ class Main(QWidget):
 
                 def prog(v, text, p=p, tag=tag):
                     progress(v, f"{text}{tag}“{os.path.basename(p)}”")
+                home = archive_home(p) if opts.get("sort") else None
                 try:
-                    res, used = archive.extract(p, opts["dest"] or os.path.dirname(p), opts["mode"], opts["overwrite"],
-                                                first_pw if i == 0 else "", book, prog, cancel,
-                                                discard=recycle_old)
+                    if home:
+                        res, used = extract_sorted(p, home, opts, first_pw if i == 0 else "", book, prog, cancel)
+                    else:
+                        res, used = archive.extract(p, opts["dest"] or os.path.dirname(p), opts["mode"],
+                                                    opts["overwrite"], first_pw if i == 0 else "", book, prog, cancel,
+                                                    discard=recycle_old)
                 except archive.PasswordError as e:
                     return dict(done=out, need_pw=i, msg=str(e))
                 except archive.Cancelled:
@@ -5894,7 +5988,7 @@ class Main(QWidget):
         self.tick()
         if ok and opts["open"] and not quiet:
             # 在应用内的列表里打开解压出来的文件夹，不弹出资源管理器
-            r = ok[0][1] if len(ok) == 1 else (opts["dest"] or os.path.dirname(ok[0][0]))
+            r = ok[0][1] if len(ok) == 1 or opts.get("sorted") else (opts["dest"] or os.path.dirname(ok[0][0]))
             if not os.path.isdir(r):
                 r = os.path.dirname(r)
             if os.path.isdir(r) and root_of(r) and self.isVisible():
@@ -5902,6 +5996,9 @@ class Main(QWidget):
         if bad and not quiet:
             Dialog(self, "解压", (f"已解压 {len(ok)} 个，" if ok else "") + f"{len(bad)} 个没有解压：\n\n"
                    + "\n".join(f"· {os.path.basename(p)}：{m}" for p, m in bad[:10]), ok="知道了").exec()
+        elif ok and not quiet and opts.get("sorted"):
+            cats = list(dict.fromkeys(opts["sorted"]))
+            self.show_toast(f"已解压，并按分类放进了“{'”“'.join(cats[:4])}”" + ("等" if len(cats) > 4 else ""))
         elif ok and not quiet:
             self.show_toast(f"已解压到“{os.path.basename(ok[0][1])}”" if len(ok) == 1 and opts["mode"] != "here"
                             else f"已解压 {len(ok)} 个压缩包")
